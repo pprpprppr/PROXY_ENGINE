@@ -1,0 +1,6 @@
+{
+  "name": "Proxy Engine (Web Prototype)",
+  "description": "A high-performance web-intercepting proxy prototype with an AI-driven scanner, fulfilling architectural tenets conceptually within a scalable TS backend.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
