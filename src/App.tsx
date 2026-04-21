@@ -211,11 +211,6 @@ export default function App() {
       .catch(e => console.error("History Error", e));
   }, [setRequests]);
 
-  // Load History on Mount
-  useEffect(() => {
-     loadHistory();
-  }, [loadHistory]);
-
   useEffect(() => {
     // Setup WebSocket
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -298,6 +293,23 @@ export default function App() {
 
   // Match & Replace State
   const [replacementRules, setReplacementRules] = useState<any[]>([]);
+  const [serverConfig, setServerConfig] = useState<{port: number, proxyPort: number}>({ port: 3000, proxyPort: 8082 });
+
+  const fetchConfig = useCallback(() => {
+    fetch('/api/config')
+      .then(r => r.json())
+      .then(data => {
+          if (data.port) setServerConfig(data);
+      })
+      .catch(e => console.error("Config Fetch Error", e));
+  }, []);
+
+  // Load History on Mount
+  useEffect(() => {
+     loadHistory();
+     fetchConfig();
+  }, [loadHistory, fetchConfig]);
+
   const fetchRules = useCallback(() => {
     fetch('/api/rules').then(r => r.json()).then(setReplacementRules).catch(console.error);
   }, []);
@@ -1380,11 +1392,11 @@ export default function App() {
                           <div className="space-y-3 font-mono text-sm">
                               <div className="flex justify-between items-center py-2 border-b border-gray-800/50">
                                   <span className="text-gray-500">Local Address</span>
-                                  <span className="text-green-400 bg-green-400/10 px-2 py-0.5 rounded border border-green-400/20">127.0.0.1</span>
+                                  <span className="text-green-400 bg-green-400/10 px-2 py-0.5 rounded border border-green-400/20">{window.location.hostname}</span>
                               </div>
                               <div className="flex justify-between items-center py-2 border-b border-gray-800/50">
                                   <span className="text-gray-500">Intercept Port</span>
-                                  <span className="text-[#00E5FF] bg-[#00E5FF]/10 px-2 py-0.5 rounded border border-[#00E5FF]/20">8082</span>
+                                  <span className="text-[#00E5FF] bg-[#00E5FF]/10 px-2 py-0.5 rounded border border-[#00E5FF]/20">{serverConfig.proxyPort}</span>
                               </div>
                               <div className="flex justify-between items-center py-2 border-b border-gray-800/50">
                                   <span className="text-gray-500">Protocols</span>
@@ -1445,7 +1457,7 @@ export default function App() {
                           <ol className="list-decimal list-inside text-sm text-gray-400 space-y-2 opacity-90">
                               <li>Go to Settings &gt; General &gt; Network Settings &gt; Settings.</li>
                               <li>Select <strong>Manual proxy configuration</strong>.</li>
-                              <li>Enter <code className="bg-gray-800 text-green-400 px-1.5 py-0.5 rounded">127.0.0.1</code> for HTTP Proxy and <code className="bg-gray-800 text-[#00E5FF] px-1.5 py-0.5 rounded">8082</code> for Port.</li>
+                              <li>Enter <code className="bg-gray-800 text-green-400 px-1.5 py-0.5 rounded">{window.location.hostname}</code> for HTTP Proxy and <code className="bg-gray-800 text-[#00E5FF] px-1.5 py-0.5 rounded">{serverConfig.proxyPort}</code> for Port.</li>
                               <li>Check <strong>"Also use this proxy for HTTPS"</strong>.</li>
                               <li>Go to Privacy & Security &gt; Certificates &gt; View Certificates.</li>
                               <li>Click <strong>Import</strong> and select the downloaded Certificate Authority file.</li>
@@ -1457,7 +1469,7 @@ export default function App() {
                           <h4 className="font-semibold text-gray-300 mb-3 flex items-center gap-2">Chrome / Edge</h4>
                           <ul className="list-disc list-inside text-sm text-gray-400 space-y-2 opacity-90">
                               <li>Use an extension like <strong>FoxyProxy Standard</strong> or <strong>SwitchyOmega</strong> for ease of use.</li>
-                              <li>Create a new proxy profile pointing to <code className="bg-gray-800 text-green-400 px-1.5 py-0.5 rounded">127.0.0.1</code> port <code className="bg-gray-800 text-[#00E5FF] px-1.5 py-0.5 rounded">8082</code>.</li>
+                              <li>Create a new proxy profile pointing to <code className="bg-gray-800 text-green-400 px-1.5 py-0.5 rounded">{window.location.hostname}</code> port <code className="bg-gray-800 text-[#00E5FF] px-1.5 py-0.5 rounded">{serverConfig.proxyPort}</code>.</li>
                               <li>To install the certificate, go to chrome://settings/security &gt; Manage Certificates.</li>
                               <li>Under the "Authorities" tab, click <strong>Import</strong> and select the downloaded file.</li>
                               <li>Check <strong>"Trust this certificate for identifying websites."</strong></li>

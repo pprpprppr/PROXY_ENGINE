@@ -48,8 +48,8 @@ process.on('exit', () => {
     }
 });
 
-const PORT = 3000;
-const PROXY_PORT = 8081;
+const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
+const PROXY_PORT = process.env.PROXY_PORT ? parseInt(process.env.PROXY_PORT) : 8082;
 
 // Global DB instance
 let db: JsonDB;
@@ -272,10 +272,21 @@ async function startServer() {
     let url = ctx.clientToProxyRequest.url;
     
     // Ensure SNI (Server Name Indication) for HTTPS requests to prevent EPROTO errors
-    if (isHttps && ctx.clientToProxyRequest.headers.host) {
-        (ctx.proxyToServerRequestOptions as any).servername = ctx.clientToProxyRequest.headers.host.split(':')[0];
-        // Ignore upstream certificate errors for diagnostic flexibility (avoids EPROTO on some legacy/self-signed sites)
+    if (isHttps) {
+        const hostHeader = ctx.clientToProxyRequest.headers.host;
+        if (hostHeader) {
+            const hostname = hostHeader.split(':')[0];
+            // Only set servername if it's not an IP address (IPs don't support SNI name indication)
+            const isIP = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(hostname);
+            if (!isIP) {
+                (ctx.proxyToServerRequestOptions as any).servername = hostname;
+            }
+        }
+        
+        // Advanced SSL/TLS Hardening
         (ctx.proxyToServerRequestOptions as any).rejectUnauthorized = false;
+        (ctx.proxyToServerRequestOptions as any).agent = false; // Disable global agent to fix EPROTO on hostname switch
+        (ctx.proxyToServerRequestOptions as any).secureOptions = require('constants').SSL_OP_NO_SSLv3 | require('constants').SSL_OP_NO_TLSv1;
     }
     
     if (!url.startsWith('http')) {
@@ -434,19 +445,52 @@ async function startServer() {
   });
 
   mitmProxy.onError((ctx, err) => {
-    console.error("MITM Proxy Error:", err);
-    broadcastToUI('proxyError', { message: err.message });
+    const errorMsg = err.message || 'Unknown error';
+    const isSSL = ctx?.isSSL;
+    const host = ctx?.clientToProxyRequest?.headers?.host || 'unknown';
+    
+    console.error(`MITM Proxy Error [${host}]:`, errorMsg);
+    
+    let advice = '';
+    if (errorMsg.includes('EPROTO')) {
+        advice = "SSL Protocol Error. This usually means the target server rejected the SSL handshake. Common fixes: Ensure you've trusted the CA certificate, or the server might require a specific TLS version.";
+    } else if (errorMsg.includes('ECONNREFUSED')) {
+        advice = "Connection Refused. The target server is not reachable.";
+    } else if (errorMsg.includes('CERT_')) {
+        advice = "Certificate Error. The upstream server has an invalid certificate.";
+    }
+
+    broadcastToUI('proxyError', { 
+        message: errorMsg,
+        host,
+        isSSL,
+        advice
+    });
   });
 
   mitmProxy.listen({ 
-    port: 8082, 
+    port: PROXY_PORT, 
     host: '0.0.0.0', 
     sslCaDir: certPath,
     keepAlive: true,
     timeout: 30000 
   }, (err) => {
-    if (err) console.error("MITM Listen Error", err);
-    else console.log("HTTPS Diagnostic MITM Gateway running on port 8082");
+    if (err) {
+        if ((err as any).code === 'EADDRINUSE') {
+            console.error(`CRITICAL: Proxy Port ${PROXY_PORT} is already in use by another process.`);
+        } else {
+            console.error("MITM Listen Error", err);
+        }
+    } else {
+        console.log(`HTTPS Diagnostic MITM Gateway running on port ${PROXY_PORT}`);
+    }
+  });
+
+  app.get("/api/config", (req, res) => {
+      res.json({
+          port: PORT,
+          proxyPort: PROXY_PORT
+      });
   });
 
   app.get("/api/ca-cert", (req, res) => {
@@ -836,8 +880,17 @@ async function startServer() {
   }, 10 * 60 * 1000);
 
   // Start Express UI server
+  server.on('error', (err: any) => {
+      if (err.code === 'EADDRINUSE') {
+          console.error(`\nCRITICAL: Port ${PORT} is already in use.`);
+          console.error(`Check if another instance is running or change the port in .env: PORT=${PORT + 1}\n`);
+          process.exit(1);
+      }
+  });
+
   server.listen(PORT, "0.0.0.0", () => {
     console.log(`Web Intercepting UI running on http://localhost:${PORT}`);
+    console.log(`Diagnostic Proxy listening on port ${PROXY_PORT}`);
   });
 }
 
