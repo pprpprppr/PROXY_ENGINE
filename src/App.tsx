@@ -293,7 +293,7 @@ export default function App() {
 
   // Match & Replace State
   const [replacementRules, setReplacementRules] = useState<any[]>([]);
-  const [serverConfig, setServerConfig] = useState<{port: number, proxyPort: number}>({ port: 3000, proxyPort: 8082 });
+  const [serverConfig, setServerConfig] = useState<{port: number, proxyPort: number, proxyStatus?: 'UP' | 'DOWN'}>({ port: 3000, proxyPort: 8082 });
 
   const fetchConfig = useCallback(() => {
     fetch('/api/config')
@@ -1380,7 +1380,14 @@ export default function App() {
                           <Settings className="w-6 h-6 text-indigo-400" /> Proxy Connectivity Hub
                       </h2>
                       <p className="text-gray-400 text-sm leading-relaxed mb-6">
-                          To intercept traffic from your browser or external tools, configure them to route traffic through the Proxy Engine's diagnostic tunnel. Since this environment isolates the ports, use the details below.
+                          To intercept traffic from your browser or external tools, configure them to route traffic through the Proxy Engine's diagnostic tunnel.
+                          {window.location.hostname.endsWith('.run.app') && (
+                              <div className="mt-3 p-3 bg-orange-500/10 border border-orange-500/20 text-orange-400 rounded-lg text-xs leading-relaxed">
+                                  <span className="font-bold block mb-1">CLOUD PREVIEW RESTRICTION</span>
+                                  Direct browser proxying to port {serverConfig.proxyPort} is restricted in the Cloud Environment due to network isolation. 
+                                  To use this feature, please <strong>run this application locally</strong> on your machine.
+                              </div>
+                          )}
                       </p>
                   </div>
                   
@@ -1390,6 +1397,16 @@ export default function App() {
                               <Wifi className="w-4 h-4 text-[#00E5FF]" /> Tunnel Configuration
                           </h3>
                           <div className="space-y-3 font-mono text-sm">
+                              <div className="flex justify-between items-center py-2 border-b border-gray-800/50">
+                                  <span className="text-gray-500">Gateway Status</span>
+                                  <div className={clsx(
+                                      "text-[10px] font-bold uppercase px-2 py-0.5 rounded flex items-center gap-1.5 border",
+                                      serverConfig.proxyStatus === 'UP' ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" : "bg-red-500/10 text-red-400 border-red-500/20 animate-pulse"
+                                  )}>
+                                      <span className={clsx("w-1.5 h-1.5 rounded-full", serverConfig.proxyStatus === 'UP' ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.5)]" : "bg-red-400")} />
+                                      {serverConfig.proxyStatus || 'OFFLINE'}
+                                  </div>
+                              </div>
                               <div className="flex justify-between items-center py-2 border-b border-gray-800/50">
                                   <span className="text-gray-500">Local Address</span>
                                   <span className="text-green-400 bg-green-400/10 px-2 py-0.5 rounded border border-green-400/20">{window.location.hostname}</span>

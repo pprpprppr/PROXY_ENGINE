@@ -468,6 +468,7 @@ async function startServer() {
     });
   });
 
+  let proxyRunning = false;
   mitmProxy.listen({ 
     port: PROXY_PORT, 
     host: '0.0.0.0', 
@@ -476,12 +477,14 @@ async function startServer() {
     timeout: 30000 
   }, (err) => {
     if (err) {
+        proxyRunning = false;
         if ((err as any).code === 'EADDRINUSE') {
             console.error(`CRITICAL: Proxy Port ${PROXY_PORT} is already in use by another process.`);
         } else {
             console.error("MITM Listen Error", err);
         }
     } else {
+        proxyRunning = true;
         console.log(`HTTPS Diagnostic MITM Gateway running on port ${PROXY_PORT}`);
     }
   });
@@ -489,7 +492,8 @@ async function startServer() {
   app.get("/api/config", (req, res) => {
       res.json({
           port: PORT,
-          proxyPort: PROXY_PORT
+          proxyPort: PROXY_PORT,
+          proxyStatus: proxyRunning ? 'UP' : 'DOWN'
       });
   });
 
