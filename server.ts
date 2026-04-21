@@ -128,6 +128,7 @@ let replacementRules: ReplaceRule[] = [];
 // Administrative Approval Gate State with Memory Reap (TTL)
 let gateEnabled = false;
 let responseGateEnabled = false;
+let ignoredDomains: string[] = [];
 
 interface PendingGate {
     resolve: (val: any) => void;
@@ -228,6 +229,8 @@ async function startServer() {
         } else if (message.type === 'TOGGLE_RESPONSE_INTERCEPT') {
           responseGateEnabled = message.payload.enabled;
           broadcastToUI('interceptStatus', { enabled: gateEnabled, responseEnabled: responseGateEnabled });
+        } else if (message.type === 'UPDATE_IGNORED_DOMAINS') {
+          ignoredDomains = Array.isArray(message.payload) ? message.payload : [];
         }
       } catch (e) {
         console.error("WS Message Error", e);
@@ -336,7 +339,12 @@ async function startServer() {
 
         let finalBody = fullBody;
 
-        if (gateEnabled) {
+        const hostname = ctx.clientToProxyRequest.headers.host || '';
+        const isIgnored = ignoredDomains.some(domain => 
+            hostname === domain || hostname.endsWith('.' + domain)
+        );
+
+        if (gateEnabled && !isIgnored) {
             packet.status = 'intercepted';
             broadcastToUI('PENDING_REVIEW', packet);
 
