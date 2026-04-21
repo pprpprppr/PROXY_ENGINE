@@ -18,6 +18,7 @@ import express from "express";
 import { createServer as createViteServer } from "vite";
 import http from "http";
 import path from "path";
+import { constants } from "node:crypto";
 import { WebSocketServer } from "ws";
 import { v4 as uuidv4 } from "uuid";
 import httpProxy from "http-proxy";
@@ -286,7 +287,7 @@ async function startServer() {
         // Advanced SSL/TLS Hardening
         (ctx.proxyToServerRequestOptions as any).rejectUnauthorized = false;
         (ctx.proxyToServerRequestOptions as any).agent = false; // Disable global agent to fix EPROTO on hostname switch
-        (ctx.proxyToServerRequestOptions as any).secureOptions = require('constants').SSL_OP_NO_SSLv3 | require('constants').SSL_OP_NO_TLSv1;
+        (ctx.proxyToServerRequestOptions as any).secureOptions = constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_TLSv1;
     }
     
     if (!url.startsWith('http')) {
