@@ -449,7 +449,10 @@ export default function App() {
     setIsSimulating(false);
   }, [simUrl, simMethod, simBody]);
 
-  const onSelectRequest = useCallback((id: string) => setSelectedReqId(id), []);
+  const onSelectRequest = useCallback((id: string) => {
+    setSelectedReqId(id);
+    setViewMode('inspector');
+  }, []);
   
   const analyzeIntercept = async () => {
     if (!activeIntercept) return;
@@ -764,6 +767,8 @@ export default function App() {
                         onClick={() => {
                             const newState = !interceptMode;
                             setInterceptMode(newState);
+                            toggleIntercept(newState);
+                            // Fallback API if WS is slow
                             fetch('/api/intercept/toggle', {
                                method: 'POST',
                                headers: {'Content-Type': 'application/json'},
@@ -995,7 +1000,16 @@ export default function App() {
                       </button>
 
                       <button 
-                         onClick={() => toggleResponseIntercept(!responseInterceptMode)}
+                         onClick={() => {
+                             const newState = !responseInterceptMode;
+                             toggleResponseIntercept(newState);
+                             setResponseInterceptMode(newState);
+                             fetch('/api/intercept/response/toggle', {
+                                method: 'POST',
+                                headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({ enabled: newState })
+                             });
+                         }}
                          className={cn(
                              "px-4 py-1.5 rounded text-xs font-bold uppercase tracking-wider border transition-all flex items-center gap-2",
                              responseInterceptMode 

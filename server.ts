@@ -269,139 +269,191 @@ async function startServer() {
   mitmProxy.use(MitmProxy.gunzip);
 
   mitmProxy.onRequest(async (ctx, callback) => {
-    const requestId = uuidv4();
-    (ctx as any).requestId = requestId;
-    const isHttps = ctx.isSSL;
-    const method = ctx.clientToProxyRequest.method;
-    let url = ctx.clientToProxyRequest.url;
-    
-    // Ensure SNI (Server Name Indication) for HTTPS requests to prevent EPROTO errors
-    if (isHttps) {
-        const hostHeader = ctx.clientToProxyRequest.headers.host;
-        if (hostHeader) {
-            const hostname = hostHeader.split(':')[0];
-            // Only set servername if it's not an IP address (IPs don't support SNI name indication)
+    try {
+        const requestId = uuidv4();
+        (ctx as any).requestId = requestId;
+        const isHttpsClient = ctx.isSSL;
+        const method = ctx.clientToProxyRequest.method;
+        let url = ctx.clientToProxyRequest.url;
+        
+        ctx.clientToProxyRequest.on('aborted', () => {
+            (ctx as any).isAborted = true;
+        });
+
+        if (!url.startsWith('http')) {
+            const hostHeader = ctx.clientToProxyRequest.headers.host;
+            if (!hostHeader) {
+                ctx.proxyToClientResponse.writeHead(400, { 'Content-Type': 'text/plain' });
+                ctx.proxyToClientResponse.end('Bad Request: Missing Host header');
+                return;
+            }
+            url = (isHttpsClient ? 'https://' : 'http://') + hostHeader + url;
+        }
+
+        const isTargetHttps = url.startsWith('https');
+
+        // Ensure SNI (Server Name Indication) for HTTPS requests
+        if (isTargetHttps) {
+            const parsedUrl = new URL(url);
+            const hostname = parsedUrl.hostname;
             const isIP = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(hostname);
             if (!isIP) {
                 (ctx.proxyToServerRequestOptions as any).servername = hostname;
             }
+            
+            // Advanced SSL/TLS Hardening
+            (ctx.proxyToServerRequestOptions as any).rejectUnauthorized = false;
+            (ctx.proxyToServerRequestOptions as any).agent = false; 
+            (ctx.proxyToServerRequestOptions as any).secureOptions = constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_TLSv1;
         }
+
+        let isCallbackCalled = false;
+        const safeCallback = (err: any) => {
+            if (isCallbackCalled) return;
+            isCallbackCalled = true;
+            callback(err);
+        };
         
-        // Advanced SSL/TLS Hardening
-        (ctx.proxyToServerRequestOptions as any).rejectUnauthorized = false;
-        (ctx.proxyToServerRequestOptions as any).agent = false; // Disable global agent to fix EPROTO on hostname switch
-        (ctx.proxyToServerRequestOptions as any).secureOptions = constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_TLSv1;
-    }
-    
-    if (!url.startsWith('http')) {
-        url = (isHttps ? 'https://' : 'http://') + ctx.clientToProxyRequest.headers.host + url;
-    }
-    
-    let bodyChunks: Buffer[] = [];
-    ctx.onRequestData((ctx, chunk, callback) => {
-       bodyChunks.push(chunk);
-       return callback(null, null); // Hold data
-    });
+        let bodyChunks: Buffer[] = [];
+        ctx.onRequestData((ctx, chunk, internalCb) => {
+           bodyChunks.push(chunk);
+           return internalCb(null, null); // Hold data
+        });
 
-    ctx.onRequestEnd(async (ctx, callback) => {
-        let fullBody = Buffer.concat(bodyChunks);
-        let reqStr = fullBody.toString('utf8');
+        ctx.onRequestEnd(async (ctx, internalCb) => {
+            try {
+                let fullBody = Buffer.concat(bodyChunks);
+                let reqStr = fullBody.toString('utf8');
 
-        // Apply Match & Replace Rules
-        replacementRules.filter(r => r.active).forEach(rule => {
-            if (rule.type === 'url' && url.includes(rule.match)) {
-                url = url.replace(new RegExp(rule.match, 'g'), rule.replace);
-                ctx.clientToProxyRequest.url = url; 
-            }
-            if (rule.type === 'body') {
-                reqStr = reqStr.replace(new RegExp(rule.match, 'g'), rule.replace);
-                fullBody = Buffer.from(reqStr, 'utf8');
-            }
-            if (rule.type === 'header') {
-                Object.keys(ctx.clientToProxyRequest.headers).forEach(h => {
-                    const val = ctx.clientToProxyRequest.headers[h];
-                    if (typeof val === 'string' && val.includes(rule.match)) {
-                        ctx.clientToProxyRequest.headers[h] = val.replace(new RegExp(rule.match, 'g'), rule.replace);
+                // Apply Match & Replace Rules
+                replacementRules.filter(r => r.active).forEach(rule => {
+                    try {
+                        if (rule.type === 'url' && url.includes(rule.match)) {
+                            url = url.replace(new RegExp(rule.match, 'g'), rule.replace);
+                            ctx.clientToProxyRequest.url = url; 
+                        }
+                        if (rule.type === 'body') {
+                            reqStr = reqStr.replace(new RegExp(rule.match, 'g'), rule.replace);
+                            fullBody = Buffer.from(reqStr, 'utf8');
+                        }
+                        if (rule.type === 'header') {
+                            Object.keys(ctx.clientToProxyRequest.headers).forEach(h => {
+                                const val = ctx.clientToProxyRequest.headers[h];
+                                if (typeof val === 'string' && val.includes(rule.match)) {
+                                    ctx.clientToProxyRequest.headers[h] = val.replace(new RegExp(rule.match, 'g'), rule.replace);
+                                }
+                            });
+                        }
+                    } catch (e) {
+                        console.warn("Rule bypass error:", e);
                     }
                 });
+                
+                const packet: any = {
+                    id: requestId,
+                    method,
+                    url,
+                    req_headers: { ...ctx.clientToProxyRequest.headers },
+                    req_body: reqStr,
+                    timestamp: Date.now(),
+                    status: 'pending'
+                };
+
+                let finalBody = fullBody;
+
+                const hostname = ctx.clientToProxyRequest.headers.host || '';
+                const isIgnored = ignoredDomains.some(domain => 
+                    hostname === domain || hostname.endsWith('.' + domain)
+                );
+
+                if (gateEnabled && !isIgnored) {
+                    packet.status = 'intercepted';
+                    broadcastToUI('PENDING_REVIEW', packet);
+
+                    const decision: any = await new Promise((resolve) => {
+                        trafficGate.set(requestId, { resolve, timestamp: Date.now() });
+                    });
+
+                    if (decision.action === 'drop') {
+                        if (!ctx.proxyToClientResponse.writableEnded) {
+                            ctx.proxyToClientResponse.writeHead(504, { 'Content-Type': 'text/plain' });
+                            ctx.proxyToClientResponse.end('Gateway Timeout: Aborted by Stateful Request Review System');
+                        }
+                        packet.status = 'dropped';
+                        savePacketAsync(packet);
+                        return internalCb(); 
+                    }
+
+                    if (decision.modifiedUrl) {
+                        ctx.clientToProxyRequest.url = decision.modifiedUrl;
+                    }
+                    if (decision.modifiedHeaders) {
+                        ctx.proxyToServerRequestOptions.headers = decision.modifiedHeaders;
+                        packet.req_headers = decision.modifiedHeaders;
+                    }
+                    if (decision.modifiedBody !== undefined) {
+                        finalBody = Buffer.from(decision.modifiedBody, 'utf8');
+                        packet.req_body = decision.modifiedBody;
+                    }
+                    if (decision.interceptResponse) {
+                        (ctx as any).interceptResponse = true;
+                    }
+                }
+
+                savePacketAsync(packet);
+                broadcastToUI('requestCaptured', packet);
+
+                try {
+                    if ((ctx as any).isAborted || ctx.clientToProxyRequest.destroyed) {
+                        return internalCb();
+                    }
+
+                    // Final protocol sanity check for outgoing request
+                    if (ctx.proxyToServerRequest) {
+                       ctx.proxyToServerRequest.setTimeout(60000, () => {
+                           ctx.proxyToServerRequest.destroy(new Error('Upstream Timeout'));
+                       });
+                       ctx.proxyToServerRequest.end(finalBody);
+                    } else {
+                       console.warn("Outbound stream not initialized, request may fail.");
+                    }
+                } catch (err) {
+                    console.error("Critical Proxy Feed Error:", err);
+                }
+                return internalCb();
+            } catch (innerErr) {
+                console.error("Proxy Data Lifecycle Internal Failure:", innerErr);
+                return internalCb();
             }
         });
-        
-        const packet: any = {
-            id: requestId,
-            method,
-            url,
-            req_headers: { ...ctx.clientToProxyRequest.headers },
-            req_body: reqStr,
-            timestamp: Date.now(),
-            status: 'pending'
-        };
 
-        let finalBody = fullBody;
-
-        const hostname = ctx.clientToProxyRequest.headers.host || '';
-        const isIgnored = ignoredDomains.some(domain => 
-            hostname === domain || hostname.endsWith('.' + domain)
-        );
-
-        if (gateEnabled && !isIgnored) {
-            packet.status = 'intercepted';
-            broadcastToUI('PENDING_REVIEW', packet);
-
-            const decision: any = await new Promise((resolve) => {
-                trafficGate.set(requestId, { resolve, timestamp: Date.now() });
-            });
-
-            if (decision.action === 'drop') {
-                ctx.proxyToClientResponse.writeHead(504, { 'Content-Type': 'text/plain' });
-                ctx.proxyToClientResponse.end('Gateway Timeout: Aborted by Stateful Request Review System');
-                packet.status = 'dropped';
-                savePacketAsync(packet);
-                return; 
-            }
-
-            if (decision.modifiedUrl) {
-                ctx.clientToProxyRequest.url = decision.modifiedUrl;
-            }
-            if (decision.modifiedHeaders) {
-                ctx.proxyToServerRequestOptions.headers = decision.modifiedHeaders;
-                packet.req_headers = decision.modifiedHeaders;
-            }
-            if (decision.modifiedBody !== undefined) {
-                finalBody = Buffer.from(decision.modifiedBody, 'utf8');
-                packet.req_body = decision.modifiedBody;
-                
-                // Protocol Integrity: Recalculate Content-Length
-                if (ctx.proxyToServerRequestOptions.headers['content-length'] || finalBody.length > 0) {
-                    ctx.proxyToServerRequestOptions.headers['content-length'] = finalBody.length.toString();
-                    packet.req_headers['content-length'] = finalBody.length.toString();
-                }
-            }
-            if (decision.interceptResponse) {
-                (ctx as any).interceptResponse = true;
-            }
+        // CRITICAL: Must call safeCallback() in onRequest to trigger the data cycle!
+        return safeCallback(null);
+    } catch (err) {
+        console.error("MITM Proxy Handler Initialization Crash:", err);
+        if (typeof callback === 'function') {
+            callback(err as any);
         }
-
-        savePacketAsync(packet);
-        broadcastToUI('requestCaptured', packet);
-
-        ctx.proxyToServerRequest.write(finalBody);
-        return callback();
-    });
-
-    return callback();
+    }
   });
 
   mitmProxy.onResponse(async (ctx, callback) => {
+    if ((ctx as any).isAborted || ctx.clientToProxyRequest.destroyed) {
+        // If client already left, don't start the response pipeline
+        return callback();
+    }
     const requestId = (ctx as any).requestId;
     let resBodyChunks: Buffer[] = [];
     
-    ctx.onResponseData((ctx, chunk, callback) => {
+    ctx.onResponseData((ctx, chunk, internalCb) => {
         resBodyChunks.push(chunk);
-        return callback(null, null); // Internal buffering
+        return internalCb(null, null); // Internal buffering
     });
 
-    ctx.onResponseEnd(async (ctx, callback) => {
+    ctx.onResponseEnd(async (ctx, internalCb) => {
+        if ((ctx as any).isAborted || ctx.clientToProxyRequest.destroyed) {
+            return internalCb();
+        }
         let fullResBody = Buffer.concat(resBodyChunks);
         let resStr = fullResBody.toString('utf8');
         
@@ -422,7 +474,7 @@ async function startServer() {
 
              if (decision.action === 'drop') {
                  ctx.proxyToClientResponse.destroy();
-                 return callback();
+                 return internalCb();
              }
              if (decision.modifiedBody !== undefined) {
                  fullResBody = Buffer.from(decision.modifiedBody, 'utf8');
@@ -447,30 +499,60 @@ async function startServer() {
         });
         
         broadcastToUI('responseCaptured', responsePacket);
-        ctx.proxyToClientResponse.write(fullResBody);
-        return callback();
+        
+        // Update response headers for final body
+        if (ctx.serverToProxyResponse.headers['content-length'] || fullResBody.length > 0) {
+            ctx.serverToProxyResponse.headers['content-length'] = fullResBody.length.toString();
+        }
+
+        try {
+            callback(null); // Send headers to client
+            if (ctx.proxyToClientResponse) {
+               ctx.proxyToClientResponse.end(fullResBody);
+            }
+            return internalCb();
+        } catch (e) {
+            console.error("Proxy Response Error:", e);
+            callback(e as any);
+            return internalCb();
+        }
     });
-    return callback();
   });
 
   mitmProxy.onError((ctx, err) => {
-    const errorMsg = err.message || 'Unknown error';
-    const isSSL = ctx?.isSSL;
-    const host = ctx?.clientToProxyRequest?.headers?.host || 'unknown';
+    const errString = (err?.message || err?.toString() || '').toLowerCase();
+    const errorCode = (err as any)?.code;
     
-    console.error(`MITM Proxy Error [${host}]:`, errorMsg);
+    // Silence common connection close/reset errors that clutter logs or UI
+    if (
+        errString.includes('aborted') || 
+        errString.includes('socket hang up') || 
+        errString.includes('econnreset') ||
+        errString.includes('epipe') ||
+        errString.includes('etimedout') ||
+        errorCode === 'ECONNRESET' ||
+        errorCode === 'EPIPE' ||
+        errorCode === 'ETIMEDOUT'
+    ) {
+        return;
+    }
+
+    const host = ctx?.clientToProxyRequest?.headers?.host || 'unknown';
+    const isSSL = ctx?.isSSL;
+    
+    console.error(`MITM Proxy Error [${host}]:`, errString);
     
     let advice = '';
-    if (errorMsg.includes('EPROTO')) {
+    if (errString.includes('eproto')) {
         advice = "SSL Protocol Error. This usually means the target server rejected the SSL handshake. Common fixes: Ensure you've trusted the CA certificate, or the server might require a specific TLS version.";
-    } else if (errorMsg.includes('ECONNREFUSED')) {
+    } else if (errString.includes('econnrefused')) {
         advice = "Connection Refused. The target server is not reachable.";
-    } else if (errorMsg.includes('CERT_')) {
+    } else if (errString.includes('cert_')) {
         advice = "Certificate Error. The upstream server has an invalid certificate.";
     }
 
     broadcastToUI('proxyError', { 
-        message: errorMsg,
+        message: errString,
         host,
         isSSL,
         advice
@@ -521,6 +603,18 @@ async function startServer() {
   app.post("/api/rules", express.json(), (req, res) => {
       replacementRules = req.body;
       res.json({ success: true });
+  });
+
+  app.post("/api/intercept/toggle", express.json(), (req, res) => {
+      gateEnabled = !!req.body.enabled;
+      broadcastToUI('interceptStatus', { enabled: gateEnabled, responseEnabled: responseGateEnabled });
+      res.json({ success: true, enabled: gateEnabled });
+  });
+
+  app.post("/api/intercept/response/toggle", express.json(), (req, res) => {
+      responseGateEnabled = !!req.body.enabled;
+      broadcastToUI('interceptStatus', { enabled: gateEnabled, responseEnabled: responseGateEnabled });
+      res.json({ success: true, enabled: responseGateEnabled });
   });
 
   app.post("/api/intercept/action", express.json(), (req, res) => {
@@ -787,7 +881,6 @@ async function startServer() {
   app.post("/api/simulate-request", express.json(), async (req, res) => {
     try {
       const { targetUrl, method = 'GET', body } = req.body;
-      let reqId = uuidv4();
       
       const fetchOpts: RequestInit = { method };
       if (body && (method === 'POST' || method === 'PUT')) {
@@ -795,21 +888,16 @@ async function startServer() {
         fetchOpts.headers = { 'Content-Type': 'application/json' };
       }
 
-      // To make simulate request interceptable, we manually pipe it through our proxy listener on PROXY_PORT
-      // by setting the absolute proxy url. But node native fetch doesn't support proxying cleanly out of the box...
-      // Instead of native fetch with an Agent, we can just hit our intercept pipeline directly for demonstration,
-      // but the easiest is simply routing the fetch directly since our intercept logic is bound to the proxy server stream.
-      // We will just do a standard proxy tunnel using standard http!
-      
       const parsedUrl = new URL(targetUrl);
       const reqOpts = {
-          hostname: '127.0.0.1',
-          port: 8082,
+          hostname: 'localhost',
+          port: PROXY_PORT,
           path: targetUrl, // Absolute URL for proxying
           method: method,
           headers: {
               ...(fetchOpts.headers as Record<string, string>),
-              'Host': parsedUrl.host
+              'Host': parsedUrl.host,
+              'User-Agent': 'Diagnostic-Proxy-Simulator/1.0'
           }
       };
 
@@ -821,8 +909,17 @@ async function startServer() {
           });
       });
 
+      proxyReq.setTimeout(30000, () => {
+         proxyReq.destroy();
+         if (!res.headersSent) {
+            res.status(504).json({ error: "Simulator Timeout - Request may still be intercepted in the UI" });
+         }
+      });
+
       proxyReq.on('error', (e) => {
-         res.status(500).json({ error: e.message });
+         if (!res.headersSent) {
+            res.status(500).json({ error: e.message });
+         }
       });
 
       if (fetchOpts.body) {
@@ -831,7 +928,9 @@ async function startServer() {
       proxyReq.end();
       
     } catch (e: any) {
-       res.status(500).json({ error: e.message });
+       if (!res.headersSent) {
+          res.status(500).json({ error: e.message });
+       }
     }
   });
 
