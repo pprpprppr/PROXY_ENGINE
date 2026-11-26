@@ -24,7 +24,7 @@
     "test": "tsx --test tests/*.test.ts",
     "electron:dev": "npm run build:server && electron .",
     "electron:build": "npm run build && electron-builder --publish never",
-    "electron:build:linux": "npm run build && electron-builder --linux deb AppImage tar.gz --publish never",
+    "electron:build:linux": "npm run build && electron-builder --linux deb --publish never",
     "electron:build:win": "npm run build && electron-builder --win nsis portable --publish never"
   },
   "build": {
@@ -37,9 +37,7 @@
     },
     "linux": {
       "target": [
-        "deb",
-        "AppImage",
-        "tar.gz"
+        "deb"
       ],
       "icon": "assets/icon.png",
       "category": "Development",

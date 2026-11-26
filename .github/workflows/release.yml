@@ -38,19 +38,15 @@ jobs:
           node-version: '24'
           cache: 'npm'
       - run: npm ci
-      - name: Package Linux .deb, AppImage, and tar.gz
+      - name: Package Linux .deb
         run: npm run electron:build:linux
-      - name: Upload Linux .deb, AppImage, and tar.gz to Release
+      - name: Upload Linux .deb to Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "ProxySuite $TAG" --notes "Automated release $TAG"
-          gh release upload "$TAG" --clobber \
-            release/proxysuite_*_amd64.deb \
-            release/ProxySuite-*.AppImage \
-            release/proxysuite-*.tar.gz \
-            release/latest-linux.yml
+          gh release upload "$TAG" --clobber release/proxysuite_*_amd64.deb
 
   release-windows:
     needs: test
@@ -76,5 +72,5 @@ jobs:
           if (-not $exists) {
             gh release create $env:TAG --title "ProxySuite $env:TAG" --notes "Automated release $env:TAG"
           }
-          $assets = Get-ChildItem -Path "release\*" -Include "*.exe","latest.yml" -File | ForEach-Object { $_.FullName }
+          $assets = Get-ChildItem -Path "release\*" -Include "*.exe" -File | ForEach-Object { $_.FullName }
           gh release upload $env:TAG --clobber @assets
