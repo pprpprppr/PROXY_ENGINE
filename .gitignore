@@ -1,8 +1,16 @@
 node_modules/
 build/
 dist/
+dist-server/
+release/
 coverage/
 .DS_Store
 *.log
+*.db
+*.db-wal
+*.db-shm
+*.bak
+*.corrupt.*
+.http-mitm-proxy/
 .env*
 !.env.example

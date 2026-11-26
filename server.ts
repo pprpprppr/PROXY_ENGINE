@@ -1,1009 +1,303 @@
-import fs from 'fs';
 import dotenv from 'dotenv';
 dotenv.config();
 
-// MANDATORY EPHEMERAL PURGE: Before any initialization to ensure cleanroom state
-const DB_FILE = 'proxy-traffic.json';
-const purgeSession = () => {
-  if (fs.existsSync(DB_FILE)) {
-    try {
-      fs.unlinkSync(DB_FILE);
-      console.log('EPHEMERAL PURGE: Cleared session database safely.');
-    } catch (e) {}
-  }
-};
-purgeSession();
+import http from 'node:http';
+import path from 'node:path';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
+import express from 'express';
+import { WebSocketServer, WebSocket } from 'ws';
+import { loadConfig, type AppConfig } from './server/config.js';
+import { DatabaseClient } from './server/db/databaseClient.js';
+import { ProxyEngine } from './server/proxy/mitmEngine.js';
+import { GeminiSecurityService } from './server/ai/geminiService.js';
+import { IntruderEngine } from './server/proxy/intruderEngine.js';
+import { createLocalSecurityMiddleware, verifyWebSocketUpgradeRequest } from './server/security.js';
+import { createApiRouter } from './server/routes/apiRouter.js';
+import { logEvent } from './server/logger.js';
 
-import express from "express";
-import { createServer as createViteServer } from "vite";
-import http from "http";
-import path from "path";
-import { constants } from "node:crypto";
-import { WebSocketServer } from "ws";
-import { v4 as uuidv4 } from "uuid";
-import httpProxy from "http-proxy";
-import * as url from "url";
-import { JsonDB } from './database.js';
-import { PassThrough } from "stream";
-import { Proxy as MitmProxy } from 'http-mitm-proxy';
-import { GoogleGenAI } from "@google/genai";
-
-// This file configures the proxy backend as well as serving the web UI.
-
-// Initialize Gemini for Server-Side Analysis
-const genAI = process.env.GEMINI_API_KEY ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }) : null;
-
-// Graceful Shutdown Portability & Cleanup
-const shutdownClean = () => {
-    console.log('\nSIGNAL RECEIVED: Executing Performance Architect Shutdown...');
-    purgeSession();
-    process.exit(0);
-};
-
-process.on('SIGINT', shutdownClean);
-process.on('SIGTERM', shutdownClean);
-process.on('exit', () => {
-    // Final sync check
-    if (fs.existsSync(DB_FILE)) {
-        try { fs.unlinkSync(DB_FILE); } catch(e) {}
-    }
-});
-
-const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
-const PROXY_PORT = process.env.PROXY_PORT ? parseInt(process.env.PROXY_PORT) : 8082;
-
-// Global DB instance
-let db: JsonDB;
-
-async function initDB() {
-  db = new JsonDB('proxy-traffic.json');
-  console.log("JSON Database initialized.");
+export interface AppRuntime {
+  config: AppConfig;
+  db: DatabaseClient;
+  proxy: ProxyEngine;
+  server: http.Server;
+  uiPort: number;
+  proxyPort: number;
+  shutdown: () => Promise<void>;
 }
 
-// Background "worker" function to save packets without blocking
-function savePacketAsync(packetData: any) {
-  setImmediate(async () => {
-    try {
-      await db.run(
-        `INSERT INTO intercepted_packets (id, timestamp, method, url, req_headers, req_body, res_headers, res_body, status_code, duration_ms, passive_analysis)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(id) DO UPDATE SET 
-            res_headers=excluded.res_headers,
-            res_body=excluded.res_body,
-            status_code=excluded.status_code,
-            duration_ms=excluded.duration_ms,
-            passive_analysis=excluded.passive_analysis`,
-        [
-          packetData.id,
-          packetData.timestamp,
-          packetData.method,
-          packetData.url,
-          JSON.stringify(packetData.req_headers || {}),
-          packetData.req_body || "",
-          packetData.res_headers ? JSON.stringify(packetData.res_headers) : null,
-          packetData.res_body || null,
-          packetData.status_code || null,
-          packetData.duration || null,
-          packetData.passive_analysis || null
-        ]
-      );
-    } catch (e) {
-      console.error("DB Save Error:", e);
-    }
-  });
-}
-
-function runPassiveScan(headers: any, body: string): string | null {
-   const findings: string[] = [];
-   const cors = headers['access-control-allow-origin'];
-   if (cors === '*') findings.push("[CORS] Wildcard Access-Control-Allow-Origin.");
-   
-   if (!headers['x-frame-options'] && !headers['content-security-policy']) {
-       findings.push("[Security Headers] Missing X-Frame-Options and Content-Security-Policy.");
-   }
-   
-   const piiPattern = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-   if (body && body.match(piiPattern)) {
-       findings.push("[PII Leakage] Potential Email addresses found in response.");
-   }
-
-   if (body && (body.includes('AKIA') || body.includes('AIza'))) {
-       findings.push("[Token Leakage] Potential API Keys found in response.");
-   }
-
-   if (findings.length === 0) return null;
-   return findings.join('\n');
-}
-
-// Match & Replace State
-interface ReplaceRule {
-  id: string;
-  match: string;
-  replace: string;
-  type: 'header' | 'body' | 'url';
-  active: boolean;
-}
-let replacementRules: ReplaceRule[] = [];
-
-// Administrative Approval Gate State with Memory Reap (TTL)
-let gateEnabled = false;
-let responseGateEnabled = false;
-let ignoredDomains: string[] = [];
-
-interface PendingGate {
-    resolve: (val: any) => void;
-    timestamp: number;
-}
-const trafficGate = new Map<string, PendingGate>();
-const responseReviewQueue = new Map<string, PendingGate>();
-
-function normalizeUrl(targetUrl: string): string {
-    if (!targetUrl) return targetUrl;
-    try {
-        if (!targetUrl.startsWith('http')) {
-            if (targetUrl.includes('.') && !targetUrl.includes('://')) {
-                return 'https://' + targetUrl;
-            }
-        }
-        return new URL(targetUrl).toString();
-    } catch {
-        return targetUrl;
-    }
-}
-
-/** STALE REQUEST REAPER: Prevent memory exhaustion from abandoned reviews */
-setInterval(() => {
-    const now = Date.now();
-    const TTL = 5 * 60 * 1000; // 5 Minute TTL
-
-    [trafficGate, responseReviewQueue].forEach(queue => {
-        for (const [id, entry] of queue.entries()) {
-            if (now - entry.timestamp > TTL) {
-                console.warn(`REAPER: Dropping stale request context [${id}] after 5min timeout.`);
-                entry.resolve({ action: 'drop' });
-                queue.delete(id);
-            }
-        }
-    });
-}, 30000); // Pulse every 30s
-
-const mitmProxy = new MitmProxy();
-
-async function startServer() {
-  await initDB();
-
-  const app = express();
-  const server = http.createServer(app);
-  
-  // WebSocket server for the UI to receive intercepted traffic
-  const wss = new WebSocketServer({ server, path: '/api/ws' });
-
-  // Store active UI client connections
-  const uiClients: any[] = [];
-
-  wss.on('connection', (ws) => {
-    uiClients.push(ws);
-    console.log("UI Performance Link Established [WS]");
-    
-    const pingInterval = setInterval(() => {
-        if (ws.readyState === 1) ws.ping();
-    }, 25000);
-
-    ws.on('message', (data) => {
-      try {
-        const message = JSON.parse(data.toString());
-        if (message.type === 'ACTION_FORWARD') {
-          const { id, modifiedUrl, modifiedHeaders, modifiedBody, interceptResponse } = message.payload;
-          
-          if (responseReviewQueue.has(id)) {
-              const entry = responseReviewQueue.get(id);
-              if (entry) {
-                  entry.resolve({ action: 'forward', modifiedBody });
-                  responseReviewQueue.delete(id);
-              }
-          } else if (trafficGate.has(id)) {
-              const entry = trafficGate.get(id);
-              if (entry) {
-                entry.resolve({ action: 'forward', modifiedUrl, modifiedHeaders, modifiedBody, interceptResponse });
-                trafficGate.delete(id);
-              }
-          }
-        } else if (message.type === 'ACTION_DROP') {
-          const { id } = message.payload;
-          if (responseReviewQueue.has(id)) {
-              const entry = responseReviewQueue.get(id);
-              if (entry) {
-                  entry.resolve({ action: 'drop' });
-                  responseReviewQueue.delete(id);
-              }
-          } else if (trafficGate.has(id)) {
-              const entry = trafficGate.get(id);
-              if (entry) {
-                entry.resolve({ action: 'drop' });
-                trafficGate.delete(id);
-              }
-          }
-        } else if (message.type === 'TOGGLE_INTERCEPT') {
-          gateEnabled = message.payload.enabled;
-          broadcastToUI('interceptStatus', { enabled: gateEnabled, responseEnabled: responseGateEnabled });
-        } else if (message.type === 'TOGGLE_RESPONSE_INTERCEPT') {
-          responseGateEnabled = message.payload.enabled;
-          broadcastToUI('interceptStatus', { enabled: gateEnabled, responseEnabled: responseGateEnabled });
-        } else if (message.type === 'UPDATE_IGNORED_DOMAINS') {
-          ignoredDomains = Array.isArray(message.payload) ? message.payload : [];
-        }
-      } catch (e) {
-        console.error("WS Message Error", e);
-      }
-    });
-
-    ws.on('close', () => {
-      clearInterval(pingInterval);
-      const idx = uiClients.indexOf(ws);
-      if (idx > -1) uiClients.splice(idx, 1);
-      console.log("UI Performance Link Severed [WS]");
-    });
-  });
-
-  const broadcastToUI = (messageType: string, payload: any) => {
-    let uiPayload = payload;
-    if (messageType === 'requestCaptured' || messageType === 'PENDING_REVIEW') {
-        uiPayload = {
-            ...payload,
-            headers: payload.req_headers || payload.headers,
-            body: payload.req_body || payload.body
-        };
-    }
-    const message = JSON.stringify({ type: messageType, payload: uiPayload });
-    uiClients.forEach(client => {
-      if (client.readyState === 1) { // OPEN
-        client.send(message);
-      }
-    });
+export async function startProxySuiteServer(overrides?: Partial<AppConfig>): Promise<AppRuntime> {
+  const baseConfig = loadConfig();
+  const config: AppConfig = {
+    ...baseConfig,
+    ...overrides,
+    defaults: {
+      ...baseConfig.defaults,
+      ...(overrides?.defaults || {}),
+    },
   };
 
-  // Setup HTTPS Diagnostic Middleware (MITM Proxy)
-  const certPath = path.join(process.cwd(), '.http-mitm-proxy');
-  if (!fs.existsSync(certPath)) fs.mkdirSync(certPath, { recursive: true });
+  // Monitor event loop lag without high-frequency timers
+  const elHistogram = monitorEventLoopDelay({ resolution: 20 });
+  elHistogram.enable();
 
-  mitmProxy.use(MitmProxy.gunzip);
+  const db = new DatabaseClient(config.dbPath, config.legacyJsonDbPath);
+  await db.waitUntilReady();
 
-  mitmProxy.onRequest(async (ctx, callback) => {
-    try {
-        const requestId = uuidv4();
-        (ctx as any).requestId = requestId;
-        const isHttpsClient = ctx.isSSL;
-        const method = ctx.clientToProxyRequest.method;
-        let url = ctx.clientToProxyRequest.url;
-        
-        ctx.clientToProxyRequest.on('aborted', () => {
-            (ctx as any).isAborted = true;
-        });
+  const app = express();
+  app.disable('x-powered-by');
+  const server = http.createServer(app);
 
-        if (!url.startsWith('http')) {
-            const hostHeader = ctx.clientToProxyRequest.headers.host;
-            if (!hostHeader) {
-                ctx.proxyToClientResponse.writeHead(400, { 'Content-Type': 'text/plain' });
-                ctx.proxyToClientResponse.end('Bad Request: Missing Host header');
-                return;
-            }
-            url = (isHttpsClient ? 'https://' : 'http://') + hostHeader + url;
-        }
+  let boundUiPort = config.port;
+  let boundProxyPort = config.proxyPort;
 
-        const isTargetHttps = url.startsWith('https');
-
-        // Ensure SNI (Server Name Indication) for HTTPS requests
-        if (isTargetHttps) {
-            const parsedUrl = new URL(url);
-            const hostname = parsedUrl.hostname;
-            const isIP = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(hostname);
-            if (!isIP) {
-                (ctx.proxyToServerRequestOptions as any).servername = hostname;
-            }
-            
-            // Advanced SSL/TLS Hardening
-            (ctx.proxyToServerRequestOptions as any).rejectUnauthorized = false;
-            (ctx.proxyToServerRequestOptions as any).agent = false; 
-            (ctx.proxyToServerRequestOptions as any).secureOptions = constants.SSL_OP_NO_SSLv3 | constants.SSL_OP_NO_TLSv1;
-        }
-
-        let isCallbackCalled = false;
-        const safeCallback = (err: any) => {
-            if (isCallbackCalled) return;
-            isCallbackCalled = true;
-            callback(err);
-        };
-        
-        let bodyChunks: Buffer[] = [];
-        ctx.onRequestData((ctx, chunk, internalCb) => {
-           bodyChunks.push(chunk);
-           return internalCb(null, null); // Hold data
-        });
-
-        ctx.onRequestEnd(async (ctx, internalCb) => {
-            try {
-                let fullBody = Buffer.concat(bodyChunks);
-                let reqStr = fullBody.toString('utf8');
-
-                // Apply Match & Replace Rules
-                replacementRules.filter(r => r.active).forEach(rule => {
-                    try {
-                        if (rule.type === 'url' && url.includes(rule.match)) {
-                            url = url.replace(new RegExp(rule.match, 'g'), rule.replace);
-                            ctx.clientToProxyRequest.url = url; 
-                        }
-                        if (rule.type === 'body') {
-                            reqStr = reqStr.replace(new RegExp(rule.match, 'g'), rule.replace);
-                            fullBody = Buffer.from(reqStr, 'utf8');
-                        }
-                        if (rule.type === 'header') {
-                            Object.keys(ctx.clientToProxyRequest.headers).forEach(h => {
-                                const val = ctx.clientToProxyRequest.headers[h];
-                                if (typeof val === 'string' && val.includes(rule.match)) {
-                                    ctx.clientToProxyRequest.headers[h] = val.replace(new RegExp(rule.match, 'g'), rule.replace);
-                                }
-                            });
-                        }
-                    } catch (e) {
-                        console.warn("Rule bypass error:", e);
-                    }
-                });
-                
-                const packet: any = {
-                    id: requestId,
-                    method,
-                    url,
-                    req_headers: { ...ctx.clientToProxyRequest.headers },
-                    req_body: reqStr,
-                    timestamp: Date.now(),
-                    status: 'pending'
-                };
-
-                let finalBody = fullBody;
-
-                const hostname = ctx.clientToProxyRequest.headers.host || '';
-                const isIgnored = ignoredDomains.some(domain => 
-                    hostname === domain || hostname.endsWith('.' + domain)
-                );
-
-                if (gateEnabled && !isIgnored) {
-                    packet.status = 'intercepted';
-                    broadcastToUI('PENDING_REVIEW', packet);
-
-                    const decision: any = await new Promise((resolve) => {
-                        trafficGate.set(requestId, { resolve, timestamp: Date.now() });
-                    });
-
-                    if (decision.action === 'drop') {
-                        if (!ctx.proxyToClientResponse.writableEnded) {
-                            ctx.proxyToClientResponse.writeHead(504, { 'Content-Type': 'text/plain' });
-                            ctx.proxyToClientResponse.end('Gateway Timeout: Aborted by Stateful Request Review System');
-                        }
-                        packet.status = 'dropped';
-                        savePacketAsync(packet);
-                        return internalCb(); 
-                    }
-
-                    if (decision.modifiedUrl) {
-                        ctx.clientToProxyRequest.url = decision.modifiedUrl;
-                    }
-                    if (decision.modifiedHeaders) {
-                        ctx.proxyToServerRequestOptions.headers = decision.modifiedHeaders;
-                        packet.req_headers = decision.modifiedHeaders;
-                    }
-                    if (decision.modifiedBody !== undefined) {
-                        finalBody = Buffer.from(decision.modifiedBody, 'utf8');
-                        packet.req_body = decision.modifiedBody;
-                    }
-                    if (decision.interceptResponse) {
-                        (ctx as any).interceptResponse = true;
-                    }
-                }
-
-                savePacketAsync(packet);
-                broadcastToUI('requestCaptured', packet);
-
-                try {
-                    if ((ctx as any).isAborted || ctx.clientToProxyRequest.destroyed) {
-                        return internalCb();
-                    }
-
-                    // Final protocol sanity check for outgoing request
-                    if (ctx.proxyToServerRequest) {
-                       ctx.proxyToServerRequest.setTimeout(60000, () => {
-                           ctx.proxyToServerRequest.destroy(new Error('Upstream Timeout'));
-                       });
-                       ctx.proxyToServerRequest.end(finalBody);
-                    } else {
-                       console.warn("Outbound stream not initialized, request may fail.");
-                    }
-                } catch (err) {
-                    console.error("Critical Proxy Feed Error:", err);
-                }
-                return internalCb();
-            } catch (innerErr) {
-                console.error("Proxy Data Lifecycle Internal Failure:", innerErr);
-                return internalCb();
-            }
-        });
-
-        // CRITICAL: Must call safeCallback() in onRequest to trigger the data cycle!
-        return safeCallback(null);
-    } catch (err) {
-        console.error("MITM Proxy Handler Initialization Crash:", err);
-        if (typeof callback === 'function') {
-            callback(err as any);
-        }
-    }
+  const uiClients = new Set<WebSocket>();
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: config.wsMaxPayloadBytes,
   });
 
-  mitmProxy.onResponse(async (ctx, callback) => {
-    if ((ctx as any).isAborted || ctx.clientToProxyRequest.destroyed) {
-        // If client already left, don't start the response pipeline
-        return callback();
-    }
-    const requestId = (ctx as any).requestId;
-    let resBodyChunks: Buffer[] = [];
-    
-    ctx.onResponseData((ctx, chunk, internalCb) => {
-        resBodyChunks.push(chunk);
-        return internalCb(null, null); // Internal buffering
-    });
-
-    ctx.onResponseEnd(async (ctx, internalCb) => {
-        if ((ctx as any).isAborted || ctx.clientToProxyRequest.destroyed) {
-            return internalCb();
-        }
-        let fullResBody = Buffer.concat(resBodyChunks);
-        let resStr = fullResBody.toString('utf8');
-        
-        const shouldInterceptResponse = (ctx as any).interceptResponse || responseGateEnabled;
-        
-        if (shouldInterceptResponse) {
-             const decision: any = await new Promise((resolve) => {
-                 responseReviewQueue.set(requestId, { resolve, timestamp: Date.now() });
-                 broadcastToUI('RESPONSE_PENDING', {
-                     id: requestId,
-                     statusCode: ctx.serverToProxyResponse.statusCode,
-                     headers: ctx.serverToProxyResponse.headers,
-                     body: resStr,
-                     url: (ctx.isSSL ? 'https://' : 'http://') + ctx.clientToProxyRequest.headers.host + ctx.clientToProxyRequest.url,
-                     status: 'response_intercepted'
-                 });
-             });
-
-             if (decision.action === 'drop') {
-                 ctx.proxyToClientResponse.destroy();
-                 return internalCb();
-             }
-             if (decision.modifiedBody !== undefined) {
-                 fullResBody = Buffer.from(decision.modifiedBody, 'utf8');
-                 resStr = fullResBody.toString('utf8');
-             }
-        }
-        
-        const responsePacket = {
-            id: requestId,
-            statusCode: ctx.serverToProxyResponse.statusCode,
-            headers: ctx.serverToProxyResponse.headers,
-            body: resStr,
-            timestamp: Date.now(),
-            duration: 0, 
-        };
-        
-        savePacketAsync({
-            id: requestId,
-            res_headers: ctx.serverToProxyResponse.headers,
-            res_body: resStr,
-            status_code: ctx.serverToProxyResponse.statusCode
-        });
-        
-        broadcastToUI('responseCaptured', responsePacket);
-        
-        // Update response headers for final body
-        if (ctx.serverToProxyResponse.headers['content-length'] || fullResBody.length > 0) {
-            ctx.serverToProxyResponse.headers['content-length'] = fullResBody.length.toString();
-        }
-
-        try {
-            callback(null); // Send headers to client
-            if (ctx.proxyToClientResponse) {
-               ctx.proxyToClientResponse.end(fullResBody);
-            }
-            return internalCb();
-        } catch (e) {
-            console.error("Proxy Response Error:", e);
-            callback(e as any);
-            return internalCb();
-        }
-    });
-  });
-
-  mitmProxy.onError((ctx, err) => {
-    const errString = (err?.message || err?.toString() || '').toLowerCase();
-    const errorCode = (err as any)?.code;
-    
-    // Silence common connection close/reset errors that clutter logs or UI
-    if (
-        errString.includes('aborted') || 
-        errString.includes('socket hang up') || 
-        errString.includes('econnreset') ||
-        errString.includes('epipe') ||
-        errString.includes('etimedout') ||
-        errorCode === 'ECONNRESET' ||
-        errorCode === 'EPIPE' ||
-        errorCode === 'ETIMEDOUT'
-    ) {
-        return;
-    }
-
-    const host = ctx?.clientToProxyRequest?.headers?.host || 'unknown';
-    const isSSL = ctx?.isSSL;
-    
-    console.error(`MITM Proxy Error [${host}]:`, errString);
-    
-    let advice = '';
-    if (errString.includes('eproto')) {
-        advice = "SSL Protocol Error. This usually means the target server rejected the SSL handshake. Common fixes: Ensure you've trusted the CA certificate, or the server might require a specific TLS version.";
-    } else if (errString.includes('econnrefused')) {
-        advice = "Connection Refused. The target server is not reachable.";
-    } else if (errString.includes('cert_')) {
-        advice = "Certificate Error. The upstream server has an invalid certificate.";
-    }
-
-    broadcastToUI('proxyError', { 
-        message: errString,
-        host,
-        isSSL,
-        advice
-    });
-  });
-
-  let proxyRunning = false;
-  mitmProxy.listen({ 
-    port: PROXY_PORT, 
-    host: '0.0.0.0', 
-    sslCaDir: certPath,
-    keepAlive: true,
-    timeout: 30000 
-  }, (err) => {
-    if (err) {
-        proxyRunning = false;
-        if ((err as any).code === 'EADDRINUSE') {
-            console.error(`CRITICAL: Proxy Port ${PROXY_PORT} is already in use by another process.`);
-        } else {
-            console.error("MITM Listen Error", err);
-        }
-    } else {
-        proxyRunning = true;
-        console.log(`HTTPS Diagnostic MITM Gateway running on port ${PROXY_PORT}`);
-    }
-  });
-
-  app.get("/api/config", (req, res) => {
-      res.json({
-          port: PORT,
-          proxyPort: PROXY_PORT,
-          proxyStatus: proxyRunning ? 'UP' : 'DOWN'
-      });
-  });
-
-  app.get("/api/ca-cert", (req, res) => {
-    const caCertPath = path.join(certPath, 'certs', 'ca.pem');
-    if (fs.existsSync(caCertPath)) {
-        res.setHeader('Content-Type', 'application/x-x509-ca-cert');
-        res.setHeader('Content-Disposition', 'attachment; filename=DiagnosticRootCA.pem');
-        fs.createReadStream(caCertPath).pipe(res);
-    } else {
-        res.status(404).send("CA certificate not yet generated. Please wait and try again.");
-    }
-  });
-
-  app.get("/api/rules", (req, res) => res.json(replacementRules));
-  app.post("/api/rules", express.json(), (req, res) => {
-      replacementRules = req.body;
-      res.json({ success: true });
-  });
-
-  app.post("/api/intercept/toggle", express.json(), (req, res) => {
-      gateEnabled = !!req.body.enabled;
-      broadcastToUI('interceptStatus', { enabled: gateEnabled, responseEnabled: responseGateEnabled });
-      res.json({ success: true, enabled: gateEnabled });
-  });
-
-  app.post("/api/intercept/response/toggle", express.json(), (req, res) => {
-      responseGateEnabled = !!req.body.enabled;
-      broadcastToUI('interceptStatus', { enabled: gateEnabled, responseEnabled: responseGateEnabled });
-      res.json({ success: true, enabled: responseGateEnabled });
-  });
-
-  app.post("/api/intercept/action", express.json(), (req, res) => {
-    const { id, action, modifiedUrl, modifiedHeaders, modifiedBody, interceptResponse } = req.body;
-    if (responseReviewQueue.has(id)) {
-        const entry = responseReviewQueue.get(id);
-        if (entry) entry.resolve({ action, modifiedBody });
-        responseReviewQueue.delete(id);
-        res.json({ success: true });
-    } else if (trafficGate.has(id)) {
-        const entry = trafficGate.get(id);
-        if (entry) {
-            entry.resolve({ action, modifiedUrl, modifiedHeaders, modifiedBody, interceptResponse });
-            trafficGate.delete(id);
-            res.json({ success: true });
-        } else {
-            res.status(404).json({ error: "Proxy Intercept entry not found or already released" });
-        }
-    } else {
-        res.status(404).json({ error: "Proxy Intercept entry not found or already released" });
-    }
-  });
-
-  // Intruder Fuzzing Engine
-  app.post("/api/intruder/run", express.json(), async (req, res) => {
-     let { method, url: rawUrl, headers, body, payloads, jitterMs, rotateUserAgent } = req.body;
-     const url = normalizeUrl(rawUrl);
-     const jobId = uuidv4();
-     res.json({ jobId, message: "Fuzz job started" });
-     
-     const userAgents = [
-         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Firefox/121.0",
-         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/110.0"
-     ];
-
-     setImmediate(async () => {
-         let baselineStatus = -1;
-         let baselineLength = -1;
-
-         for (let i = 0; i < payloads.length; i += 10) {
-             const batchPayloads = payloads.slice(i, i + 10);
-             const batch = batchPayloads.map(async (payload: string) => {
-                 const reqId = uuidv4();
-                 const payloadUrl = url.replace(/\{FUZZ\}/g, payload);
-                 let payloadBody = body;
-                 if (body) {
-                     payloadBody = typeof body === 'string' ? body.replace(/\{FUZZ\}/g, payload) : JSON.stringify(body).replace(/\{FUZZ\}/g, payload);
-                 }
-                 
-                 let payloadHeaders: any = {};
-                 if (headers) {
-                     for (const [k, v] of Object.entries(headers)) {
-                         const lowerKey = k.toLowerCase();
-                         if (lowerKey === 'host' || lowerKey === 'content-length' || lowerKey === 'connection' || lowerKey === 'accept-encoding') {
-                             continue;
-                         }
-                         payloadHeaders[k] = String(v).replace(/\{FUZZ\}/g, payload);
-                     }
-                 }
-                 
-                 if (rotateUserAgent) {
-                     payloadHeaders['user-agent'] = userAgents[Math.floor(Math.random() * userAgents.length)];
-                 }
-
-                 if (jitterMs && jitterMs > 0) {
-                     const jitterVal = Math.max(0, jitterMs + (Math.random() * 100 - 50)); // +/- 50ms random scatter
-                     await new Promise(r => setTimeout(r, jitterVal));
-                 }
-
-                 const fetchOpts: RequestInit = { method, headers: payloadHeaders };
-                 if (payloadBody && method !== 'GET' && method !== 'HEAD') {
-                     fetchOpts.body = payloadBody;
-                 }
-                 
-                 const startTime = Date.now();
-                 try {
-                     const response = await fetch(payloadUrl, fetchOpts);
-                     const resBody = await response.text();
-                     const duration = Date.now() - startTime;
-                     
-                     return {
-                         reqId, payload,
-                         statusCode: response.status,
-                         headers: Object.fromEntries(response.headers.entries()),
-                         body: resBody,
-                         length: resBody.length,
-                         duration,
-                         error: null
-                     };
-                 } catch (e: any) {
-                     return {
-                         reqId, payload,
-                         statusCode: 0,
-                         length: 0,
-                         duration: Date.now() - startTime,
-                         error: e.message
-                     };
-                 }
-             });
-             
-             const batchResults = await Promise.allSettled(batch);
-             const processedResults = batchResults.map((r: any) => r.status === 'fulfilled' ? r.value : { error: r.reason });
-             
-             // Baseline from first payload
-             if (i === 0 && processedResults.length > 0 && !processedResults[0].error) {
-                 baselineStatus = processedResults[0].statusCode;
-                 baselineLength = processedResults[0].length;
-             }
-             
-             broadcastToUI('fuzzProgress', { 
-                 jobId, 
-                 current: Math.min(i + 10, payloads.length), 
-                 total: payloads.length,
-                 results: processedResults.map(r => ({ 
-                     ...r, 
-                     isAnomaly: (!r.error && (r.statusCode !== baselineStatus || Math.abs(r.length - baselineLength) > 10)) 
-                 }))
-             });
-         }
-         
-         broadcastToUI('fuzzComplete', { jobId });
-     });
-  });
-
-  app.get("/api/session/export", (req, res) => {
-      // Export current database to a downloadable file
-      if (fs.existsSync(DB_FILE)) {
-          const dateStr = new Date().toISOString().split('T')[0];
-          res.setHeader('Content-Type', 'application/json');
-          res.setHeader('Content-Disposition', `attachment; filename=audit_session_${dateStr}.json`);
-          fs.createReadStream(DB_FILE).pipe(res);
-      } else {
-          // If DB file doesn't exist yet (no traffic), send empty array
-          res.setHeader('Content-Type', 'application/json');
-          res.setHeader('Content-Disposition', `attachment; filename=audit_session_empty.json`);
-          res.send(JSON.stringify([], null, 2));
-      }
-  });
-
-  app.post("/api/session/import", express.json({ limit: '50mb' }), async (req, res) => {
-      try {
-          const sessionData = req.body;
-          if (!Array.isArray(sessionData)) {
-              return res.status(400).json({ error: "Invalid session format. Expected an array of captured packets." });
-          }
-
-          // HARDENED VALIDATION: Basic schema check for data integrity
-          const isValid = sessionData.every(p => p && typeof p.id === 'string' && typeof p.url === 'string');
-          if (!isValid && sessionData.length > 0) {
-              return res.status(400).json({ error: "Secure Audit Validation Failed: Incompatible session schema." });
-          }
-
-          // Overwrite the persistent store
-          fs.writeFileSync(DB_FILE, JSON.stringify(sessionData, null, 2));
-          
-          // Re-instantiate database to point to the imported data
-          await initDB();
-          
-          // Notify all UI clients to refresh their display
-          broadcastToUI('SESSION_RELOADED', { message: 'Cloud Session Restored' });
-          
-          res.json({ success: true, count: sessionData.length });
-      } catch (e: any) {
-          console.error("Session Import Error:", e);
-          res.status(500).json({ error: e.message || "Unknown error during import" });
-      }
-  });
-
-  app.get("/api/history", async (req, res) => {
-     try {
-       const limit = parseInt((req.query.limit as string) || "100");
-       const offset = parseInt((req.query.offset as string) || "0");
-       const packets = await db.all(`SELECT * FROM intercepted_packets ORDER BY timestamp DESC LIMIT ? OFFSET ?`, [limit, offset]);
-       
-       // Format to match UI expectations
-       const formatted = packets.map((p: any) => ({
-         id: p.id,
-         method: p.method,
-         url: p.url,
-         headers: typeof p.req_headers === 'string' ? JSON.parse(p.req_headers) : (p.req_headers || {}),
-         body: p.req_body,
-         timestamp: p.timestamp,
-         status: p.status_code ? 'completed' : 'pending',
-         response: p.status_code ? {
-            statusCode: p.status_code,
-            headers: typeof p.res_headers === 'string' ? JSON.parse(p.res_headers) : (p.res_headers || {}),
-            body: p.res_body,
-            timestamp: p.timestamp + (p.duration_ms || 0),
-            duration: p.duration_ms,
-            passiveAnalysis: p.passive_analysis
-         } : undefined
-       }));
-       res.json(formatted);
-     } catch (e: any) {
-       res.status(500).json({ error: e.message });
-     }
-  });
-
-  // Repeater Endpoint (Replaces Tauri command)
-  app.post("/api/repeater", express.json(), async (req, res) => {
-     try {
-        let { method, url: rawUrl, headers, body } = req.body;
-        const url = normalizeUrl(rawUrl);
-        
-        const startTime = Date.now();
-        const fetchOpts: RequestInit = { method };
-        if (body && (method !== 'GET' && method !== 'HEAD')) {
-           fetchOpts.body = typeof body === 'string' ? body : JSON.stringify(body);
-        }
-        
-        // Strip out forbidden fetch headers that browser/node will complain about
-        const cleanHeaders: Record<string, string> = {};
-        if (headers) {
-            for (const [key, val] of Object.entries(headers)) {
-                const lowerKey = key.toLowerCase();
-                if (lowerKey === 'host' || lowerKey === 'content-length' || lowerKey === 'connection' || lowerKey === 'accept-encoding') {
-                    continue;
-                }
-                cleanHeaders[key] = val as string;
-            }
-        }
-        fetchOpts.headers = cleanHeaders;
-
-        const response = await fetch(url, fetchOpts);
-        const resBody = await response.text();
-        const duration_ms = Date.now() - startTime;
-
-        const result = {
-           status_code: response.status,
-           headers: Object.fromEntries(response.headers.entries()),
-           body: resBody,
-           duration_ms
-        };
-
-        // Also log this new repeated request to DB & emit
-        const reqId = uuidv4();
-        const packet = {
-           id: reqId,
-           method,
-           url,
-           req_headers: cleanHeaders,
-           req_body: fetchOpts.body,
-           timestamp: Date.now(),
-           status_code: response.status,
-           res_headers: result.headers,
-           res_body: resBody,
-           duration: duration_ms
-        };
-        savePacketAsync(packet);
-        broadcastToUI('requestCaptured', { ...packet, headers: cleanHeaders, body: fetchOpts.body });
-        broadcastToUI('responseCaptured', { id: reqId, statusCode: response.status, headers: result.headers, body: resBody, duration: duration_ms });
-
-        res.json(result);
-     } catch (e: any) {
-        res.status(500).json({ error: e.message });
-     }
-  });
-
-  // Provide a simulator endpoint since users can't easily configure 
-  // their external browser to use port 8080 of a containerized app.
-  app.post("/api/simulate-request", express.json(), async (req, res) => {
-    try {
-      const { targetUrl, method = 'GET', body } = req.body;
-      
-      const fetchOpts: RequestInit = { method };
-      if (body && (method === 'POST' || method === 'PUT')) {
-        fetchOpts.body = typeof body === 'string' ? body : JSON.stringify(body);
-        fetchOpts.headers = { 'Content-Type': 'application/json' };
-      }
-
-      const parsedUrl = new URL(targetUrl);
-      const reqOpts = {
-          hostname: 'localhost',
-          port: PROXY_PORT,
-          path: targetUrl, // Absolute URL for proxying
-          method: method,
-          headers: {
-              ...(fetchOpts.headers as Record<string, string>),
-              'Host': parsedUrl.host,
-              'User-Agent': 'Diagnostic-Proxy-Simulator/1.0'
-          }
+  const broadcastToUI = (messageType: string, payload: unknown) => {
+    if (uiClients.size === 0) return;
+    let uiPayload = payload;
+    if (messageType === 'requestCaptured' || messageType === 'PENDING_REVIEW') {
+      const p = payload as Record<string, unknown>;
+      uiPayload = {
+        ...p,
+        headers: p.req_headers || p.headers,
+        body: p.req_body || p.body,
       };
-
-      const proxyReq = http.request(reqOpts, (proxyRes) => {
-          let data = '';
-          proxyRes.on('data', chunk => data += chunk);
-          proxyRes.on('end', () => {
-             res.json({ success: true, simulated: true, status: proxyRes.statusCode });
-          });
-      });
-
-      proxyReq.setTimeout(30000, () => {
-         proxyReq.destroy();
-         if (!res.headersSent) {
-            res.status(504).json({ error: "Simulator Timeout - Request may still be intercepted in the UI" });
-         }
-      });
-
-      proxyReq.on('error', (e) => {
-         if (!res.headersSent) {
-            res.status(500).json({ error: e.message });
-         }
-      });
-
-      if (fetchOpts.body) {
-          proxyReq.write(fetchOpts.body);
-      }
-      proxyReq.end();
-      
-    } catch (e: any) {
-       if (!res.headersSent) {
-          res.status(500).json({ error: e.message });
-       }
     }
-  });
-
-  app.post("/api/analyze", express.json(), async (req, res) => {
-      if (!genAI) {
-          return res.status(500).json({ error: "GEMINI_API_KEY not configured on server." });
+    const serialized = JSON.stringify({ type: messageType, payload: uiPayload });
+    for (const client of uiClients) {
+      if (client.readyState === WebSocket.OPEN && client.bufferedAmount < 4 * 1024 * 1024) {
+        client.send(serialized);
       }
-      try {
-          const { method, url, headers, body, response } = req.body;
-          
-          const prompt = `You are a Senior Penetration Tester. Analyze this HTTP transaction for complex logic flaws, such as IDOR, privilege escalation, or insecure business logic. Provide a concise summary of risks and a proof-of-concept.
-          
-          Method: ${method}
-          URL: ${url}
-          Headers: ${JSON.stringify(headers)}
-          Body: ${body}
-          
-          Response Status: ${response?.statusCode}
-          Response Headers: ${JSON.stringify(response?.headers)}
-          Response Body: ${response?.body}
-          `;
+    }
+  };
 
-          const result = await genAI.models.generateContent({
-              model: "gemini-1.5-pro",
-              contents: [{ role: 'user', parts: [{ text: prompt }] }]
-          });
-          
-          res.json({ text: result.text });
-      } catch (e: any) {
-          res.status(500).json({ error: e.message });
-      }
-  });
+  const proxy = new ProxyEngine(config, db, broadcastToUI);
+  await proxy.init();
 
+  const gemini = new GeminiSecurityService(config);
+  const intruder = new IntruderEngine(broadcastToUI);
 
-  // Vite middleware for development UI
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
+  server.on('upgrade', (req, socket, head) => {
+    const reqPath = (req.url || '').split('?')[0];
+    if (reqPath !== '/api/ws') {
+      socket.destroy();
+      return;
+    }
+    const authCheck = verifyWebSocketUpgradeRequest(req, {
+      port: boundUiPort,
+      host: config.host,
+      apiToken: config.apiToken,
+      requireToken: config.requireApiToken,
     });
-    app.use(vite.middlewares);
+    if (!authCheck.ok) {
+      logEvent('warn', 'ws', 'Rejected WebSocket connection', { reason: authCheck.reason });
+      socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+    });
+  });
+
+  wss.on('connection', (ws) => {
+    uiClients.add(ws);
+    const pingInterval = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) ws.ping();
+    }, 25_000);
+    pingInterval.unref();
+
+    ws.on('message', (raw) => {
+      try {
+        const text = raw.toString();
+        if (text.length > 2 * 1024 * 1024) return;
+        const message = JSON.parse(text);
+        if (!message || typeof message.type !== 'string') return;
+        const payload = message.payload || {};
+
+        if (message.type === 'ACTION_FORWARD' && typeof payload.id === 'string') {
+          proxy.resolveIntercept(payload.id, {
+            action: 'forward',
+            modifiedMethod: typeof payload.modifiedMethod === 'string' ? payload.modifiedMethod : undefined,
+            modifiedUrl: typeof payload.modifiedUrl === 'string' ? payload.modifiedUrl : undefined,
+            modifiedHeaders:
+              payload.modifiedHeaders && typeof payload.modifiedHeaders === 'object'
+                ? payload.modifiedHeaders
+                : undefined,
+            modifiedBody: typeof payload.modifiedBody === 'string' ? payload.modifiedBody : undefined,
+            interceptResponse: Boolean(payload.interceptResponse),
+          });
+        } else if (message.type === 'ACTION_DROP' && typeof payload.id === 'string') {
+          proxy.resolveIntercept(payload.id, { action: 'drop' });
+        } else if (message.type === 'TOGGLE_INTERCEPT') {
+          proxy.gateEnabled = Boolean(payload.enabled);
+          broadcastToUI('interceptStatus', {
+            enabled: proxy.gateEnabled,
+            responseEnabled: proxy.responseGateEnabled,
+          });
+        } else if (message.type === 'TOGGLE_RESPONSE_INTERCEPT') {
+          proxy.responseGateEnabled = Boolean(payload.enabled);
+          broadcastToUI('interceptStatus', {
+            enabled: proxy.gateEnabled,
+            responseEnabled: proxy.responseGateEnabled,
+          });
+        } else if (message.type === 'UPDATE_IGNORED_DOMAINS' && Array.isArray(payload)) {
+          proxy.ignoredDomains = payload
+            .map((d) => String(d).trim().toLowerCase())
+            .filter(Boolean)
+            .slice(0, 500);
+          void db.setSetting('ignoredDomains', proxy.ignoredDomains);
+        }
+      } catch (err) {
+        logEvent('warn', 'ws', 'Malformed WS client message', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    });
+
+    const cleanup = () => {
+      clearInterval(pingInterval);
+      uiClients.delete(ws);
+    };
+    ws.on('close', cleanup);
+    ws.on('error', cleanup);
+  });
+
+  // Security middleware for local API & Host/Origin validation
+  app.use((req, res, next) =>
+    createLocalSecurityMiddleware({
+      port: boundUiPort,
+      host: config.host,
+      apiToken: config.apiToken,
+      requireToken: config.requireApiToken,
+    })(req, res, next)
+  );
+
+  // Mount modular API routes
+  app.use(
+    '/api',
+    createApiRouter({
+      config,
+      db,
+      proxy,
+      gemini,
+      intruder,
+      broadcast: broadcastToUI,
+      getBoundPorts: () => ({ uiPort: boundUiPort, proxyPort: boundProxyPort }),
+      health: {
+        getEventLoopStats: () => ({
+          mean: Math.round((elHistogram.mean / 1e6) * 100) / 100,
+          p95: Math.round((elHistogram.percentile(95) / 1e6) * 100) / 100,
+          max: Math.round((elHistogram.max / 1e6) * 100) / 100,
+        }),
+        getWsClientCount: () => uiClients.size,
+      },
+    })
+  );
+
+  // Serve frontend (Vite dev middleware in dev, dist/ static assets in prod)
+  let viteServer: { close: () => Promise<void>; middlewares: any } | null = null;
+  const distPath = path.resolve(process.env.PROXYSUITE_DIST_DIR || path.join(process.cwd(), 'dist'));
+
+  if (process.env.NODE_ENV !== 'production' && process.env.PROXYSUITE_DISABLE_VITE !== '1') {
+    const { createServer: createViteServer } = await import('vite');
+    viteServer = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(viteServer.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
-  // Database Vacuum Worker (Every 10 min, clear older than 24 hours)
-  setInterval(async () => {
-    try {
-       const expirationTime = Date.now() - (24 * 60 * 60 * 1000);
-       await db.run(`DELETE FROM intercepted_packets WHERE timestamp < ?`, [expirationTime]);
-       console.log("Vacuumed stale DB records");
-    } catch (e) {
-       console.error("Vacuum error", e);
-    }
-  }, 10 * 60 * 1000);
+  // Start MITM proxy and HTTP UI server
+  const proxyBound = await proxy.listen();
+  boundProxyPort = proxyBound.port;
 
-  // Start Express UI server
-  server.on('error', (err: any) => {
-      if (err.code === 'EADDRINUSE') {
-          console.error(`\nCRITICAL: Port ${PORT} is already in use.`);
-          console.error(`Check if another instance is running or change the port in .env: PORT=${PORT + 1}\n`);
-          process.exit(1);
+  await new Promise<void>((resolve, reject) => {
+    const onErr = (err: Error) => reject(err);
+    server.once('error', onErr);
+    server.listen(config.port, config.host, () => {
+      server.off('error', onErr);
+      const addr = server.address();
+      if (typeof addr === 'object' && addr?.port) {
+        boundUiPort = addr.port;
       }
+      resolve();
+    });
   });
 
-  server.listen(PORT, "0.0.0.0", () => {
-    console.log(`Web Intercepting UI running on http://localhost:${PORT}`);
-    console.log(`Diagnostic Proxy listening on port ${PROXY_PORT}`);
+  logEvent('info', 'server', 'ProxySuite UI & API listening', {
+    url: `http://${config.host}:${boundUiPort}`,
+    proxy: `${config.proxyHost}:${boundProxyPort}`,
+    dbPath: config.dbPath,
   });
+
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logEvent('info', 'server', 'Graceful shutdown initiated (preserving database)');
+
+    elHistogram.disable();
+    for (const ws of uiClients) {
+      try {
+        ws.close(1001, 'Server shutting down');
+      } catch {
+        // ignore
+      }
+    }
+    uiClients.clear();
+    wss.close();
+
+    if (viteServer) {
+      await viteServer.close();
+    }
+    await proxy.close();
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await db.close();
+  };
+
+  return {
+    config,
+    db,
+    proxy,
+    server,
+    uiPort: boundUiPort,
+    proxyPort: boundProxyPort,
+    shutdown,
+  };
 }
 
-startServer();
+// Run directly as entrypoint (skip if imported by tests)
+const isDirectMain =
+  process.argv[1] &&
+  (process.argv[1].endsWith('server.ts') || process.argv[1].endsWith('server.js'));
+
+if (isDirectMain && process.env.PROXYSUITE_NO_AUTOSTART !== '1') {
+  startProxySuiteServer()
+    .then((runtime) => {
+      const handleSignal = async (signal: string) => {
+        logEvent('info', 'server', `Signal received: ${signal}`);
+        await runtime.shutdown();
+        process.exit(0);
+      };
+      process.on('SIGINT', () => void handleSignal('SIGINT'));
+      process.on('SIGTERM', () => void handleSignal('SIGTERM'));
+    })
+    .catch((err) => {
+      logEvent('error', 'server', 'Fatal startup error', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      process.exit(1);
+    });
+}

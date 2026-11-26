@@ -1,36 +1,27 @@
-# Use a latest Node.js image
-FROM node:18-slim
+# Use Node.js 24 LTS (includes built-in node:sqlite in WAL mode)
+FROM node:24-slim
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies if needed (e.g., for sqlite or native builds)
-RUN apt-get update && apt-get install -y \
-    python3 \
-    make \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy package files
 COPY package*.json ./
 
-# Install production dependencies
-RUN npm install
+RUN npm ci --ignore-scripts
 
-# Copy the rest of the application
 COPY . .
 
-# Build the frontend (Vite)
 RUN npm run build
 
-# Expose the application ports
-# 3000: Web UI
-# 8081: Proxy Interceptor
-EXPOSE 3000
-EXPOSE 8081
-
-# Set production environment
+# Persist SQLite database and generated Root CA in /data
+ENV PROXYSUITE_DATA_DIR=/data
 ENV NODE_ENV=production
+ENV HOST=0.0.0.0
+ENV PROXY_HOST=0.0.0.0
+ENV PORT=3000
+ENV PROXY_PORT=8082
 
-# Start the server
-CMD ["npm", "run", "start"]
+VOLUME ["/data"]
+
+EXPOSE 3000
+EXPOSE 8082
+
+CMD ["npm", "run", "start:prod"]

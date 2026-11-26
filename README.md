@@ -1,90 +1,86 @@
-# ProxySuite: High-Performance Diagnostic Proxy
+# ProxySuite (`PROXY_ENGINE` v2.0)
 
-A full-stack Node.js and React application for intercepting, analyzing, and modifying HTTP/HTTPS traffic.
+A high-performance, security-hardened HTTP/HTTPS diagnostic proxy and authorized security testing platform built with Node.js, TypeScript, SQLite (WAL), React, and Electron.
 
-## Features
+## Key Capabilities
 
-- **Real-time Interception**: Pause and modify HTTP requests/responses.
-- **AI-Powered Analysis**: Integrated Gemini AI for automated security reviews and logic flaw detection.
-- **Traffic Repeater & Intruder**: Replay and fuzz requests with custom payloads.
-- **WebSocket Inspector**: View and interact with binary/text frames.
-- **Mitm Engine**: Built-in Root CA generation for HTTPS inspection.
-- **Session Management**: Export and port audit logs between environments.
+- **Streaming MITM HTTP/HTTPS Proxy (`127.0.0.1:8082`)**:
+  - Bounded request/response body capture (`MAX_REQ_BODY_CAPTURE_BYTES`, `MAX_RES_BODY_CAPTURE_BYTES`) with truncation markers—large downloads and binary streams pass through without unbounded memory growth.
+  - Strict upstream TLS verification enabled by default (`TLSv1.2+`, SNI support, optional explicit diagnostic override for self-signed targets).
+  - Transparent decompression (`gzip`, `deflate`, `br`) for inspection while preserving original wire compression.
+  - Live Request & Response Intercept with editable method, URL, headers, body, and conditional Breakpoint rules.
+  - ReDoS-validated Match & Replace rules.
+- **Persistent Worker-Isolated SQLite Database (`proxysuite.db`)**:
+  - Runs `node:sqlite` in a dedicated `worker_threads` worker in WAL mode with prepared statements and batched transactions.
+  - Preserves all traffic across restarts and automatically migrates legacy `proxy-traffic.json` records.
+  - Automatic pre-migration backups, integrity verification/recovery, JSON & HAR 1.2 export/import (with secret redaction), and user-controlled retention or clearing.
+- **Traffic Inspector, Repeater, Controlled Intruder & WebSocket Inspector**:
+  - Server-side paginated filtering, body search, timing breakdown (`TTFB` + total duration), tagging, bookmarking, collections, duplicate detection, and response diffing.
+  - Multi-tab Repeater with query param sync, auth helper, collections, history, response comparison, and cURL export.
+  - Scope-enforced Controlled Intruder with bounded concurrency, pause/resume/stop controls, baseline comparison, and anomaly detection.
+  - Real-time proxied WebSocket connection & frame inspector (text & hex binary).
+- **Backend-Only Gemini AI Defensive Analysis**:
+  - Configurable `GEMINI_MODEL` (default `gemini-2.5-flash`), secret/header/JWT redaction, timeouts, retries, and structured vulnerability findings.
+- **System Health & Observability**:
+  - RSS/Heap memory telemetry, event-loop lag (`p95`/`mean`/`max`), active connections, SQLite queue depth, and structured redacted logs.
 
-## Local Installation
+## Quick Start
 
 ### Prerequisites
 
-- [Node.js](https://nodejs.org/) (v18 or higher)
-- [npm](https://www.npmjs.com/) or [yarn](https://yarnpkg.com/)
+- **Node.js v22.12+ / v24+ / v26+** (requires built-in `node:sqlite`)
+- **npm 10+**
 
-### 1. Clone & Install
+### 1. Install Dependencies
 
 ```bash
-git clone <your-repo-url>
-cd proxysuite
-npm install
+npm ci
 ```
 
 ### 2. Configure Environment
-
-Create a `.env` file in the root directory:
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and add your **GEMINI_API_KEY**. You can get one for free at [Google AI Studio](https://aistudio.google.com/app/apikey).
+Optionally add `GEMINI_API_KEY` and `GEMINI_MODEL` in `.env` for AI analysis.
 
-### 3. Start the Application
+### 3. Run in Development
 
 ```bash
 npm run dev
 ```
 
-The application will be available at [http://localhost:3000](http://localhost:3000).
+- **Web UI & Local API**: `http://127.0.0.1:3000`
+- **HTTP/HTTPS MITM Proxy**: `127.0.0.1:8082`
 
-## Advanced Execution Modes
-
-### 1. Standalone Desktop App (Electron)
-
-To run ProxySuite as a dedicated desktop application window:
+### 4. Production Build & Start
 
 ```bash
-npm run electron:dev
+npm run build
+npm run start:prod
 ```
 
-To package it for distribution as a portable executable:
+### 5. Electron Desktop App
 
 ```bash
+# Development mode
+npm run electron:dev
+
+# Package desktop app
 npm run electron:build
 ```
 
-### 2. Docker Container
+> Note: When using npm 11+ with strict script policies, ensure Electron's install script is permitted if running Electron locally.
 
-To run ProxySuite in a fully isolated containerized environment:
+### 6. Automated Tests
 
 ```bash
-# Build the image
-docker build -t proxysuite .
-
-# Run the container
-docker run -p 3000:3000 -p 8081:8081 --env-file .env proxysuite
+npm test
 ```
 
-## Usage
+## Security & Authorized Use
 
-1. **Configure Browser Proxy**: Point your browser's HTTP proxy to `127.0.0.1:8081`.
-2. **Install Root CA**: If inspecting HTTPS, download the CA certificate provided in the UI 'Settings' tab and install it in your browser/OS trust store.
-3. **Analyze Traffic**: Use the 'Inspector' tab to view traffic and click 'AI Scan' to trigger a security analysis.
-
-## Project Structure
-
-- `server.ts`: Express backend and Mitm proxy engine.
-- `src/App.tsx`: Main React UI.
-- `src/hooks/useTraffic.ts`: Global state management for captured packets.
-- `database.ts`: Persistence layer for audit logs.
-
-## Security Warning
-
-This tool is for diagnostic and educational purposes only. Do not use it to intercept traffic on networks you do not own. Always ensure the generated Root CA is kept secure.
+- Local API, WebSocket bus, and MITM proxy bind to `127.0.0.1` by default, protected by Host/Origin checks and a per-session runtime token.
+- Active testing tools (Repeater, Intruder, Simulator) enforce Target Scope and SSRF/private-network protection by default. Configure authorized hosts (or enable Localhost for local test targets) in **Settings & Health → Authorized Target Scope**.
+- Only intercept or test systems you own or have explicit authorization to test. Keep your generated MITM Root CA private key protected.
