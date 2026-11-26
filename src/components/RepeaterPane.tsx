@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import {
   Activity,
+  ArrowRightLeft,
   Check,
   Copy,
   FolderPlus,
@@ -10,6 +11,8 @@ import {
   Loader2,
   Plus,
   Send,
+  ShieldCheck,
+  Target,
   X,
 } from 'lucide-react';
 import type { RepeaterTab, RequestCollection, SavedRequestItem } from '../types/proxy';
@@ -23,6 +26,9 @@ interface RepeaterPaneProps {
   onAddTab: () => void;
   onCloseTab: (id: string) => void;
   onUpdateTab: (id: string, patch: Partial<RepeaterTab>) => void;
+  onSendToIntruder?: (method: string, url: string, headers: string, body: string) => void;
+  onSendToDecoder?: (text: string) => void;
+  onSendToComparer?: (slot: 'left' | 'right', label: string, text: string) => void;
 }
 
 function parseRawHeaders(raw: string): Record<string, string> {
@@ -64,11 +70,15 @@ export function RepeaterPane({
   onAddTab,
   onCloseTab,
   onUpdateTab,
+  onSendToIntruder,
+  onSendToDecoder,
+  onSendToComparer,
 }: RepeaterPaneProps) {
   const activeTab = tabs.find((t) => t.id === activeTabId) || tabs[0];
   const [isSending, setIsSending] = useState(false);
   const [copiedCurl, setCopiedCurl] = useState(false);
   const [reqSubTab, setReqSubTab] = useState<'headers' | 'params' | 'body' | 'auth' | 'history' | 'collections'>('headers');
+  const [resSubTab, setResSubTab] = useState<'pretty' | 'raw' | 'headers'>('pretty');
   const [showCompare, setShowCompare] = useState(false);
   const [authType, setAuthType] = useState<'bearer' | 'basic' | 'apikey'>('bearer');
   const [authValue, setAuthValue] = useState('');
@@ -114,7 +124,7 @@ export function RepeaterPane({
       }
       onUpdateTab(activeTab.id, { url: u.toString() });
     } catch {
-      // ignore invalid URL
+      // ignore
     }
   };
 
@@ -131,22 +141,16 @@ export function RepeaterPane({
   const applyAuthHeader = () => {
     if (!authValue.trim()) return;
     const current = parseRawHeaders(activeTab.headers);
-    if (authType === 'bearer') {
-      current['Authorization'] = `Bearer ${authValue.trim()}`;
-    } else if (authType === 'basic') {
-      current['Authorization'] = `Basic ${btoa(authValue.trim())}`;
-    } else {
-      current[authKeyName.trim() || 'X-API-Key'] = authValue.trim();
-    }
-    const serialized = Object.entries(current)
-      .map(([k, v]) => `${k}: ${v}`)
-      .join('\n');
+    if (authType === 'bearer') current['Authorization'] = `Bearer ${authValue.trim()}`;
+    else if (authType === 'basic') current['Authorization'] = `Basic ${btoa(authValue.trim())}`;
+    else current[authKeyName.trim() || 'X-API-Key'] = authValue.trim();
+    const serialized = Object.entries(current).map(([k, v]) => `${k}: ${v}`).join('\n');
     onUpdateTab(activeTab.id, { headers: serialized });
   };
 
   const executeRepeater = async () => {
     if (!activeTab.url.trim()) {
-      onUpdateTab(activeTab.id, { error: 'Target URL is required' });
+      onUpdateTab(activeTab.id, { error: 'Enter a target URL before sending.' });
       return;
     }
     setIsSending(true);
@@ -188,6 +192,34 @@ export function RepeaterPane({
     setIsSending(false);
   };
 
+  const allowCurrentHostInScope = async () => {
+    try {
+      const parsed = new URL(activeTab.url);
+      const hostname = parsed.hostname.toLowerCase();
+      const sRes = await apiFetch('/api/settings');
+      const sData = await sRes.json();
+      const scope = sData.settings?.targetScope || {};
+      const isLocal = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+      const updatedScope = isLocal
+        ? { ...scope, allowLocalhost: true }
+        : {
+            ...scope,
+            allowedHosts: Array.from(new Set([...(scope.allowedHosts || []), hostname])),
+          };
+      const putRes = await apiFetch('/api/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ targetScope: updatedScope }),
+      });
+      if (putRes.ok) {
+        onUpdateTab(activeTab.id, { error: null });
+        await executeRepeater();
+      }
+    } catch {
+      // ignore
+    }
+  };
+
   const handleCopyCurl = () => {
     navigator.clipboard
       .writeText(buildCurlCommand(activeTab))
@@ -198,21 +230,26 @@ export function RepeaterPane({
       .catch(() => {});
   };
 
+  const isScopeError = Boolean(
+    activeTab.error &&
+      (activeTab.error.toLowerCase().includes('scope') || activeTab.error.toLowerCase().includes('loopback'))
+  );
+
   return (
-    <div className="flex-1 flex flex-col min-h-0 bg-[#0E1015]">
+    <div className="flex-1 flex flex-col min-h-0 bg-[#0B0D12]">
       {/* Repeater Tabs Bar */}
-      <div className="h-9 bg-[#12141A] border-b border-gray-800 flex items-center px-2 gap-1 overflow-x-auto shrink-0">
+      <div className="h-9 bg-[#12151D] border-b border-gray-800 flex items-center px-3 gap-1 overflow-x-auto shrink-0">
         {tabs.map((tab) => (
           <div
             key={tab.id}
             onClick={() => onSelectTab(tab.id)}
-            className={`px-2.5 py-1 rounded-t text-[11px] font-mono cursor-pointer flex items-center gap-2 border-t border-x ${
+            className={`px-3 py-1 rounded-t text-xs font-mono cursor-pointer flex items-center gap-2 border-t border-x ${
               tab.id === activeTab.id
-                ? 'bg-[#1C1F26] border-gray-700 text-[#00E5FF]'
-                : 'bg-transparent border-transparent text-gray-500 hover:text-gray-300'
+                ? 'bg-[#191D28] border-gray-700 text-[#00E5FF] font-semibold'
+                : 'bg-transparent border-transparent text-gray-400 hover:text-gray-200'
             }`}
           >
-            <span className="truncate max-w-[120px]">{tab.title}</span>
+            <span className="truncate max-w-[140px]">{tab.title}</span>
             {tabs.length > 1 && (
               <button
                 onClick={(e) => {
@@ -228,7 +265,7 @@ export function RepeaterPane({
         ))}
         <button
           onClick={onAddTab}
-          className="p-1 rounded text-gray-400 hover:text-white hover:bg-gray-800"
+          className="p-1.5 rounded text-gray-400 hover:text-white hover:bg-gray-800"
           title="New Repeater Tab"
         >
           <Plus className="w-3.5 h-3.5" />
@@ -236,60 +273,92 @@ export function RepeaterPane({
       </div>
 
       {/* Request Action Bar */}
-      <div className="h-12 border-b border-gray-800 flex items-center px-3 gap-2 shrink-0 bg-[#14161C]">
+      <div className="h-12 border-b border-gray-800 flex items-center px-4 gap-2 shrink-0 bg-[#141720]">
         <select
           value={activeTab.method}
           onChange={(e) => onUpdateTab(activeTab.id, { method: e.target.value })}
-          className="bg-[#0E1015] border border-gray-700 rounded px-2 py-1 text-xs text-gray-300 focus:outline-none"
+          className="bg-[#0B0D12] border border-gray-700 rounded-lg px-2.5 py-1.5 text-xs font-mono font-bold text-indigo-300"
         >
           {['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'].map((m) => (
             <option key={m}>{m}</option>
           ))}
         </select>
         <input
-          className="flex-1 bg-[#0E1015] border border-gray-700 rounded px-3 py-1 text-xs font-mono text-gray-300 focus:outline-none focus:border-[#00E5FF]"
+          className="flex-1 bg-[#0B0D12] border border-gray-700 rounded-lg px-3 py-1.5 text-xs font-mono text-gray-200 focus:outline-none focus:border-[#00E5FF]"
           value={activeTab.url}
           onChange={(e) => onUpdateTab(activeTab.id, { url: e.target.value })}
           placeholder="https://authorized-target.example/api/resource"
         />
         <button
-          onClick={handleCopyCurl}
-          className="bg-gray-800 hover:bg-gray-700 text-gray-300 px-2.5 py-1.5 rounded text-xs flex items-center gap-1 border border-gray-700"
-          title="Copy as cURL"
-        >
-          {copiedCurl ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-          cURL
-        </button>
-        <button
           onClick={executeRepeater}
           disabled={isSending}
-          className="bg-[#00E5FF]/15 hover:bg-[#00E5FF]/25 text-[#00E5FF] px-3.5 py-1.5 rounded text-xs font-bold flex items-center gap-1.5 border border-[#00E5FF]/30 disabled:opacity-50"
+          className="bg-[#00E5FF]/20 hover:bg-[#00E5FF]/30 text-[#00E5FF] px-4 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 border border-[#00E5FF]/40 disabled:opacity-50"
         >
           {isSending ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
           Send
         </button>
+        <button
+          onClick={handleCopyCurl}
+          className="bg-gray-800 hover:bg-gray-700 text-gray-200 px-2.5 py-1.5 rounded-lg text-xs flex items-center gap-1 border border-gray-700"
+        >
+          {copiedCurl ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+          cURL
+        </button>
+        {onSendToIntruder && (
+          <button
+            onClick={() => onSendToIntruder(activeTab.method, activeTab.url, activeTab.headers, activeTab.body)}
+            className="bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 px-2.5 py-1.5 rounded-lg text-xs flex items-center gap-1 border border-indigo-500/30"
+          >
+            <Target className="w-3 h-3" /> Intruder
+          </button>
+        )}
+        {onSendToDecoder && (
+          <button
+            onClick={() => onSendToDecoder(activeTab.body || activeTab.url)}
+            className="bg-gray-800 hover:bg-gray-700 text-gray-200 px-2.5 py-1.5 rounded-lg text-xs flex items-center gap-1 border border-gray-700"
+          >
+            <ArrowRightLeft className="w-3 h-3" /> Decoder
+          </button>
+        )}
       </div>
 
       {activeTab.error && (
-        <div className="px-3 py-2 bg-red-950/40 border-b border-red-500/30 text-xs text-red-300 font-mono">
-          {activeTab.error}
+        <div className="px-4 py-2.5 bg-red-950/40 border-b border-red-500/30 text-xs text-red-200 flex items-center justify-between gap-3">
+          <span className="font-mono">{activeTab.error}</span>
+          {isScopeError && (
+            <button
+              onClick={allowCurrentHostInScope}
+              className="px-3 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-semibold flex items-center gap-1.5 shrink-0"
+            >
+              <ShieldCheck className="w-3.5 h-3.5" /> Authorize This Host & Retry
+            </button>
+          )}
         </div>
       )}
 
-      {/* Split Workspace */}
+      {/* Side-by-Side Request | Response */}
       <div className="flex-1 flex min-h-0 divide-x divide-gray-800 overflow-hidden">
-        {/* Left: Request Editor */}
+        {/* Request Editor */}
         <div className="flex-1 flex flex-col min-w-0">
-          <div className="flex border-b border-gray-800 bg-[#14161C] text-[10px] uppercase font-bold">
-            {(['headers', 'params', 'body', 'auth', 'history', 'collections'] as const).map((t) => (
+          <div className="flex border-b border-gray-800 bg-[#141720] text-[11px] font-semibold">
+            {(
+              [
+                ['headers', 'Headers'],
+                ['params', 'Query Params'],
+                ['body', 'Body'],
+                ['auth', 'Auth Helper'],
+                ['history', 'History'],
+                ['collections', 'Collections'],
+              ] as const
+            ).map(([id, label]) => (
               <button
-                key={t}
-                onClick={() => setReqSubTab(t)}
+                key={id}
+                onClick={() => setReqSubTab(id)}
                 className={`px-3 py-2 border-b-2 transition-colors ${
-                  reqSubTab === t ? 'border-[#00E5FF] text-[#00E5FF]' : 'border-transparent text-gray-500 hover:text-gray-300'
+                  reqSubTab === id ? 'border-[#00E5FF] text-[#00E5FF]' : 'border-transparent text-gray-400 hover:text-gray-200'
                 }`}
               >
-                {t}
+                {label}
               </button>
             ))}
           </div>
@@ -297,7 +366,7 @@ export function RepeaterPane({
           <div className="flex-1 overflow-auto p-3 text-xs font-mono">
             {reqSubTab === 'headers' && (
               <textarea
-                className="w-full h-full min-h-[260px] bg-[#0A0C10] border border-gray-800 rounded p-3 text-emerald-400 focus:outline-none focus:border-[#00E5FF] resize-none"
+                className="w-full h-full min-h-[260px] bg-[#12151D] border border-gray-800 rounded-lg p-3 text-emerald-300 focus:outline-none focus:border-[#00E5FF] resize-none"
                 value={activeTab.headers}
                 onChange={(e) => onUpdateTab(activeTab.id, { headers: e.target.value })}
                 placeholder="Content-Type: application/json"
@@ -306,13 +375,13 @@ export function RepeaterPane({
 
             {reqSubTab === 'params' && (
               <div className="space-y-2">
-                <div className="flex justify-between items-center text-[11px] text-gray-400">
-                  <span>Query Parameters (synced with URL)</span>
+                <div className="flex justify-between items-center text-gray-400">
+                  <span>Query Parameters (synced automatically with URL)</span>
                   <button
                     onClick={addQueryParam}
-                    className="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30"
+                    className="px-2.5 py-1 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30"
                   >
-                    + Add Param
+                    + Add Parameter
                   </button>
                 </div>
                 {queryParams.length === 0 && <div className="text-gray-600 italic">No query parameters in URL.</div>}
@@ -321,12 +390,12 @@ export function RepeaterPane({
                     <input
                       value={k}
                       onChange={(e) => updateQueryParam(i, e.target.value, v)}
-                      className="flex-1 bg-[#0A0C10] border border-gray-700 rounded px-2 py-1 text-indigo-300"
+                      className="flex-1 bg-[#12151D] border border-gray-700 rounded px-2 py-1 text-indigo-300"
                     />
                     <input
                       value={v}
                       onChange={(e) => updateQueryParam(i, k, e.target.value)}
-                      className="flex-1 bg-[#0A0C10] border border-gray-700 rounded px-2 py-1 text-gray-300"
+                      className="flex-1 bg-[#12151D] border border-gray-700 rounded px-2 py-1 text-gray-200"
                     />
                   </div>
                 ))}
@@ -335,7 +404,7 @@ export function RepeaterPane({
 
             {reqSubTab === 'body' && (
               <textarea
-                className="w-full h-full min-h-[260px] bg-[#0A0C10] border border-gray-800 rounded p-3 text-gray-300 focus:outline-none focus:border-[#00E5FF] resize-none"
+                className="w-full h-full min-h-[260px] bg-[#12151D] border border-gray-800 rounded-lg p-3 text-gray-200 focus:outline-none focus:border-[#00E5FF] resize-none"
                 value={activeTab.body}
                 onChange={(e) => onUpdateTab(activeTab.id, { body: e.target.value })}
                 placeholder="Request body..."
@@ -343,17 +412,17 @@ export function RepeaterPane({
             )}
 
             {reqSubTab === 'auth' && (
-              <div className="space-y-3 bg-[#14161C] p-3 rounded border border-gray-800">
-                <div className="flex items-center gap-2 text-gray-300 font-bold">
-                  <KeyRound className="w-4 h-4 text-amber-400" /> Authentication Header Helper
+              <div className="space-y-3 bg-[#141720] p-4 rounded-xl border border-gray-800">
+                <div className="flex items-center gap-2 text-gray-200 font-bold font-sans">
+                  <KeyRound className="w-4 h-4 text-amber-400" /> Quick Authentication Header Builder
                 </div>
                 <select
                   value={authType}
                   onChange={(e) => setAuthType(e.target.value as 'bearer' | 'basic' | 'apikey')}
-                  className="w-full bg-[#0A0C10] border border-gray-700 rounded px-2 py-1.5 text-gray-300"
+                  className="w-full bg-[#0B0D12] border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200"
                 >
-                  <option value="bearer">Bearer Token</option>
-                  <option value="basic">Basic Auth (user:password)</option>
+                  <option value="bearer">Bearer Token (Authorization: Bearer ...)</option>
+                  <option value="basic">Basic Auth (username:password)</option>
                   <option value="apikey">Custom API Key Header</option>
                 </select>
                 {authType === 'apikey' && (
@@ -361,20 +430,20 @@ export function RepeaterPane({
                     value={authKeyName}
                     onChange={(e) => setAuthKeyName(e.target.value)}
                     placeholder="Header Name (e.g. X-API-Key)"
-                    className="w-full bg-[#0A0C10] border border-gray-700 rounded px-2 py-1.5 text-gray-300"
+                    className="w-full bg-[#0B0D12] border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200"
                   />
                 )}
                 <input
                   value={authValue}
                   onChange={(e) => setAuthValue(e.target.value)}
-                  placeholder={authType === 'basic' ? 'username:password' : 'Token / Key value'}
-                  className="w-full bg-[#0A0C10] border border-gray-700 rounded px-2 py-1.5 text-gray-300"
+                  placeholder={authType === 'basic' ? 'username:password' : 'Token or API key value'}
+                  className="w-full bg-[#0B0D12] border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200"
                 />
                 <button
                   onClick={applyAuthHeader}
-                  className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-xs font-bold"
+                  className="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-bold"
                 >
-                  Apply to Headers
+                  Inject into Headers
                 </button>
               </div>
             )}
@@ -383,20 +452,20 @@ export function RepeaterPane({
               <div className="space-y-1.5">
                 {activeTab.history.length === 0 && (
                   <div className="text-gray-600 italic flex items-center gap-2">
-                    <History className="w-4 h-4" /> No Repeater requests executed in this tab yet.
+                    <History className="w-4 h-4" /> No requests sent from this tab yet.
                   </div>
                 )}
                 {activeTab.history.map((h, i) => (
                   <div
                     key={i}
                     onClick={() => onUpdateTab(activeTab.id, { method: h.method, url: h.url })}
-                    className="p-2 rounded bg-[#14161C] border border-gray-800 hover:border-gray-700 cursor-pointer flex justify-between"
+                    className="p-2.5 rounded-lg bg-[#141720] border border-gray-800 hover:border-gray-700 cursor-pointer flex justify-between"
                   >
                     <span className="truncate">
                       <span className="text-indigo-400 font-bold mr-2">{h.method}</span>
                       {h.url}
                     </span>
-                    <span className="text-gray-500 shrink-0 ml-2">
+                    <span className="text-gray-400 shrink-0 ml-2">
                       {h.statusCode} · {h.durationMs}ms
                     </span>
                   </div>
@@ -411,7 +480,7 @@ export function RepeaterPane({
                     value={newCollectionName}
                     onChange={(e) => setNewCollectionName(e.target.value)}
                     placeholder="New collection name..."
-                    className="flex-1 bg-[#0A0C10] border border-gray-700 rounded px-2 py-1 text-gray-300"
+                    className="flex-1 bg-[#12151D] border border-gray-700 rounded-lg px-3 py-1.5 text-gray-200"
                   />
                   <button
                     onClick={async () => {
@@ -424,7 +493,7 @@ export function RepeaterPane({
                       setNewCollectionName('');
                       loadCollections();
                     }}
-                    className="px-3 py-1 bg-indigo-600/20 text-indigo-300 border border-indigo-500/30 rounded flex items-center gap-1"
+                    className="px-3 py-1.5 bg-indigo-600/20 text-indigo-300 border border-indigo-500/30 rounded-lg flex items-center gap-1"
                   >
                     <FolderPlus className="w-3.5 h-3.5" /> Create
                   </button>
@@ -432,7 +501,7 @@ export function RepeaterPane({
                 {collections.map((c) => {
                   const items = savedRequests.filter((r) => r.collectionId === c.id);
                   return (
-                    <div key={c.id} className="p-2 rounded bg-[#14161C] border border-gray-800 space-y-2">
+                    <div key={c.id} className="p-3 rounded-xl bg-[#141720] border border-gray-800 space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="font-bold text-gray-200">{c.name}</span>
                         <button
@@ -450,7 +519,7 @@ export function RepeaterPane({
                             });
                             loadCollections();
                           }}
-                          className="text-[10px] px-2 py-0.5 bg-emerald-500/15 text-emerald-300 rounded border border-emerald-500/30"
+                          className="text-[11px] px-2.5 py-0.5 bg-emerald-500/15 text-emerald-300 rounded border border-emerald-500/30"
                         >
                           + Save Current Tab
                         </button>
@@ -462,13 +531,11 @@ export function RepeaterPane({
                             onUpdateTab(activeTab.id, {
                               method: item.method,
                               url: item.url,
-                              headers: Object.entries(item.headers || {})
-                                .map(([k, v]) => `${k}: ${v}`)
-                                .join('\n'),
+                              headers: Object.entries(item.headers || {}).map(([k, v]) => `${k}: ${v}`).join('\n'),
                               body: item.body || '',
                             })
                           }
-                          className="p-1.5 rounded bg-[#0A0C10] hover:bg-gray-800/70 cursor-pointer flex justify-between text-[11px]"
+                          className="p-2 rounded bg-[#0B0D12] hover:bg-gray-800/70 cursor-pointer flex justify-between text-[11px]"
                         >
                           <span className="truncate">
                             <span className="text-indigo-400 mr-1.5">{item.method}</span>
@@ -484,67 +551,105 @@ export function RepeaterPane({
           </div>
         </div>
 
-        {/* Right: Response Viewer */}
-        <div className="flex-1 flex flex-col bg-[#0A0C10] min-w-0">
+        {/* Response Viewer */}
+        <div className="flex-1 flex flex-col bg-[#0D1017] min-w-0">
           {activeTab.response ? (
             <>
-              <div className="h-9 border-b border-gray-800 bg-[#14161C] px-3 flex items-center justify-between text-[11px] font-mono shrink-0">
+              <div className="h-9 border-b border-gray-800 bg-[#141720] px-3 flex items-center justify-between text-[11px] font-mono shrink-0">
                 <div className="flex items-center gap-3">
                   <span className={`font-bold ${statusCategoryLabel(activeTab.response.status_code).color}`}>
                     {activeTab.response.status_code} ({statusCategoryLabel(activeTab.response.status_code).label})
                   </span>
                   <span className="text-gray-400">{activeTab.response.duration_ms}ms</span>
                   <span className="text-gray-500">{activeTab.response.bodySize ?? activeTab.response.body.length} B</span>
-                  {activeTab.response.redirectsFollowed ? (
-                    <span className="text-indigo-400">{activeTab.response.redirectsFollowed} redirect(s)</span>
-                  ) : null}
                 </div>
-                {activeTab.previousResponse && (
-                  <button
-                    onClick={() => setShowCompare((v) => !v)}
-                    className={`px-2 py-0.5 rounded border flex items-center gap-1 text-[10px] ${
-                      showCompare
-                        ? 'bg-[#00E5FF]/20 border-[#00E5FF]/40 text-[#00E5FF]'
-                        : 'border-gray-700 text-gray-400'
-                    }`}
-                  >
-                    <GitCompare className="w-3 h-3" /> Compare Prev
-                  </button>
-                )}
+                <div className="flex items-center gap-1.5">
+                  {(['pretty', 'headers', 'raw'] as const).map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => setResSubTab(t)}
+                      className={`px-2 py-0.5 rounded capitalize ${
+                        resSubTab === t ? 'bg-[#00E5FF]/20 text-[#00E5FF]' : 'text-gray-400 hover:text-white'
+                      }`}
+                    >
+                      {t}
+                    </button>
+                  ))}
+                  {activeTab.previousResponse && (
+                    <button
+                      onClick={() => setShowCompare((v) => !v)}
+                      className={`px-2 py-0.5 rounded border flex items-center gap-1 ${
+                        showCompare ? 'bg-[#00E5FF]/20 border-[#00E5FF]/40 text-[#00E5FF]' : 'border-gray-700 text-gray-400'
+                      }`}
+                    >
+                      <GitCompare className="w-3 h-3" /> Delta
+                    </button>
+                  )}
+                  {onSendToComparer && (
+                    <button
+                      onClick={() =>
+                        onSendToComparer('right', `Repeater: ${activeTab.method} ${activeTab.url}`, activeTab.response?.body || '')
+                      }
+                      className="px-2 py-0.5 rounded border border-gray-700 text-gray-300 hover:bg-gray-800"
+                    >
+                      To Comparer
+                    </button>
+                  )}
+                </div>
               </div>
 
               <div className="flex-1 overflow-auto p-4 font-mono text-[11px] leading-relaxed">
                 {showCompare && activeTab.previousResponse && (
-                  <div className="mb-4 p-2.5 rounded bg-[#14161C] border border-gray-800 text-[10px]">
+                  <div className="mb-4 p-2.5 rounded-lg bg-[#141720] border border-gray-800 text-[11px]">
                     <div className="text-[#00E5FF] font-bold mb-1">
-                      Delta vs Previous ({activeTab.previousResponse.status_code} / {activeTab.previousResponse.duration_ms}ms /{' '}
-                      {activeTab.previousResponse.body.length}B)
+                      Comparison vs Previous ({activeTab.previousResponse.status_code} · {activeTab.previousResponse.duration_ms}ms)
                     </div>
                     <div>
-                      Size Δ: {activeTab.response.body.length - activeTab.previousResponse.body.length} bytes · Time Δ:{' '}
+                      Size Δ: {activeTab.response.body.length - activeTab.previousResponse.body.length} B · Time Δ:{' '}
                       {activeTab.response.duration_ms - activeTab.previousResponse.duration_ms}ms
                     </div>
                   </div>
                 )}
 
-                <div className="space-y-0.5 mb-3">
-                  {Object.entries(activeTab.response.headers || {}).map(([k, v]) => (
-                    <div key={k} className="text-gray-300 break-all">
-                      {k}: <span className="text-gray-500">{v}</span>
+                {resSubTab === 'raw' ? (
+                  <pre className="whitespace-pre-wrap break-all text-gray-300">
+                    {[
+                      `HTTP/1.1 ${activeTab.response.status_code}`,
+                      ...Object.entries(activeTab.response.headers || {}).map(([k, v]) => `${k}: ${v}`),
+                      '',
+                      activeTab.response.body,
+                    ].join('\n')}
+                  </pre>
+                ) : resSubTab === 'headers' ? (
+                  <div className="space-y-1">
+                    {Object.entries(activeTab.response.headers || {}).map(([k, v]) => (
+                      <div key={k} className="text-gray-300 break-all border-b border-gray-800/40 pb-1">
+                        <span className="text-emerald-300">{k}:</span> {v}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <>
+                    <div className="space-y-0.5 mb-3">
+                      {Object.entries(activeTab.response.headers || {}).map(([k, v]) => (
+                        <div key={k} className="text-gray-300 break-all">
+                          {k}: <span className="text-gray-500">{v}</span>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
-                <PrettyViewer
-                  body={activeTab.response.body}
-                  bodySize={activeTab.response.bodySize}
-                  bodyTruncated={activeTab.response.bodyTruncated}
-                />
+                    <PrettyViewer
+                      body={activeTab.response.body}
+                      bodySize={activeTab.response.bodySize}
+                      bodyTruncated={activeTab.response.bodyTruncated}
+                    />
+                  </>
+                )}
               </div>
             </>
           ) : (
-            <div className="flex-1 flex flex-col items-center justify-center text-gray-600 italic space-y-2 opacity-40">
+            <div className="flex-1 flex flex-col items-center justify-center text-gray-600 italic space-y-2 opacity-50">
               <Activity className="w-10 h-10" />
-              <p className="text-[10px] uppercase font-bold tracking-widest">Awaiting execution</p>
+              <p className="text-xs">Click Send to execute request and inspect response</p>
             </div>
           )}
         </div>

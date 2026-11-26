@@ -23,9 +23,9 @@
     "lint": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
     "electron:dev": "npm run build:server && electron .",
-    "electron:build": "npm run build && electron-builder",
-    "electron:build:linux": "npm run build && electron-builder --linux deb AppImage tar.gz",
-    "electron:build:win": "npm run build && electron-builder --win nsis portable"
+    "electron:build": "npm run build && electron-builder --publish never",
+    "electron:build:linux": "npm run build && electron-builder --linux deb AppImage tar.gz --publish never",
+    "electron:build:win": "npm run build && electron-builder --win nsis portable --publish never"
   },
   "build": {
     "appId": "com.proxysuite.desktop",

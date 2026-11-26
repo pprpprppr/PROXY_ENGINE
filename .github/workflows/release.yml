@@ -38,7 +38,8 @@ jobs:
           node-version: '24'
           cache: 'npm'
       - run: npm ci
-      - run: npm run electron:build:linux
+      - name: Package Linux .deb, AppImage, and tar.gz
+        run: npm run electron:build:linux
       - name: Upload Linux .deb, AppImage, and tar.gz to Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -61,7 +62,8 @@ jobs:
           node-version: '24'
           cache: 'npm'
       - run: npm ci
-      - run: npm run electron:build:win
+      - name: Package Windows NSIS Installer & Portable EXE
+        run: npm run electron:build:win
       - name: Upload Windows .exe Installer and Portable to Release
         shell: pwsh
         env:

@@ -18,8 +18,13 @@ interface TrafficState {
   wsConnections: WebSocketConnectionRecord[];
   wsFrames: WebSocketFrameRecord[];
   isCapturing: boolean;
+  decoderInput: string;
+  comparerLeft: { label: string; text: string } | null;
+  comparerRight: { label: string; text: string } | null;
 
   setCapturing: (capturing: boolean) => void;
+  setDecoderInput: (text: string) => void;
+  setComparerSlot: (slot: 'left' | 'right', item: { label: string; text: string } | null) => void;
   setSummaries: (items: PacketSummary[], total: number) => void;
   upsertLiveSummaries: (incoming: PacketSummary[]) => void;
   updateLiveResponse: (payload: {
@@ -99,8 +104,14 @@ export const useTrafficStore = create<TrafficState>((set) => ({
   wsConnections: [],
   wsFrames: [],
   isCapturing: true,
+  decoderInput: '',
+  comparerLeft: null,
+  comparerRight: null,
 
   setCapturing: (isCapturing) => set({ isCapturing }),
+  setDecoderInput: (decoderInput) => set({ decoderInput }),
+  setComparerSlot: (slot, item) =>
+    set(slot === 'left' ? { comparerLeft: item } : { comparerRight: item }),
 
   setSummaries: (items, total) => set({ summaries: items, totalCount: total }),
 
