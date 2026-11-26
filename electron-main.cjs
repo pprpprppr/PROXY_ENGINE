@@ -169,12 +169,19 @@ function createWindow() {
     return;
   }
 
+  const iconPath = path.join(
+    __dirname,
+    'assets',
+    process.platform === 'win32' ? 'icon.ico' : 'icon.png'
+  );
+
   mainWindow = new BrowserWindow({
     width: 1360,
     height: 860,
     minWidth: 960,
     minHeight: 640,
     title: 'ProxySuite Desktop',
+    ...(fs.existsSync(iconPath) ? { icon: iconPath } : {}),
     backgroundColor: '#0E1015',
     webPreferences: {
       nodeIntegration: false,
@@ -199,6 +206,9 @@ function createWindow() {
 }
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.proxysuite.desktop');
+}
 if (!gotSingleInstanceLock) {
   app.quit();
 } else {

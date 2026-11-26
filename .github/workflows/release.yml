@@ -1,0 +1,78 @@
+name: Build & Release ProxySuite
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to upload artifacts to'
+        required: true
+        default: 'v2.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci --ignore-scripts
+      - run: npm run lint
+      - run: npm run build
+      - run: PROXYSUITE_DISABLE_VITE=1 npm test
+
+  release-linux:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run electron:build:linux
+      - name: Upload Linux .deb, AppImage, and tar.gz to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "ProxySuite $TAG" --notes "Automated release $TAG"
+          gh release upload "$TAG" --clobber \
+            release/proxysuite_*_amd64.deb \
+            release/ProxySuite-*.AppImage \
+            release/proxysuite-*.tar.gz \
+            release/latest-linux.yml
+
+  release-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run electron:build:win
+      - name: Upload Windows .exe Installer and Portable to Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exists = $true
+          try { gh release view $env:TAG | Out-Null } catch { $exists = $false }
+          if (-not $exists) {
+            gh release create $env:TAG --title "ProxySuite $env:TAG" --notes "Automated release $env:TAG"
+          }
+          $assets = Get-ChildItem -Path "release\*" -Include "*.exe","latest.yml" -File | ForEach-Object { $_.FullName }
+          gh release upload $env:TAG --clobber @assets
